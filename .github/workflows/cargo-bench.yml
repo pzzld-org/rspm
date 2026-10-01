@@ -82,7 +82,7 @@ jobs:
         with:
           key: cargo-${{ matrix.toolchain }}-${{ matrix.target }}-${{ matrix.features }}
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache: false
           target: ${{ matrix.target }}

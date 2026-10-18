@@ -18,7 +18,7 @@ keywords = []
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/FL03/rspm.git"
-rust-version = "1.96.0"
+rust-version = "1.98.0"
 version = "0.0.2"
 
 [workspace.dependencies]
@@ -68,7 +68,7 @@ proc-macro2 = { version = "1" }
 smart-default = { version = "0.7" }
 static_assertions = { version = "1" }
 strum = { default-features = false, features = ["derive"], version = "0.28" }
-syn = { features = ["full", "parsing", "visit"], version = "2" }
+syn = { features = ["full", "parsing", "visit"], version = "3" }
 # serialization
 schemars = { default-features = false, features = ["derive"], version = "1" }
 serde = { default-features = false, features = ["derive"], version = "1" }
@@ -77,11 +77,10 @@ serde_json = { default-features = false, version = "1" }
 serde_path_to_error = { version = "0.1" }
 # polymarket
 polymarket_client_sdk_v2 = { path = "patches/polymarket_client_sdk_v2", version = "0.7" }
-# data-structures
 # WebAssembly
 wasm-bindgen = { default-features = false, version = "0.2" }
 # WebAssembly System Interface
-wit-bindgen = { default-features = false, version = "0.60" }
+wit-bindgen = { default-features = false, version = "0.61" }
 # tracing
 tracing = { default-features = false, features = ["attributes"], version = "0.1" }
 

@@ -2,7 +2,6 @@
 build = "build.rs"
 description = "Custom Polymarket utilities and primitives supporting integration into the axiom pipeline"
 name = "rspm"
-publish = false
 
 authors.workspace = true
 categories.workspace = true

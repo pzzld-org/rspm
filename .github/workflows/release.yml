@@ -30,6 +30,11 @@ jobs:
       discussions: write
       issues: write
       pull-requests: write
+    outputs:
+      proceed: ${{ steps.detect.outputs.proceed }}
+      release_sha: ${{ steps.ver.outputs.release_sha }}
+      release_tag: ${{ steps.ver.outputs.tag }}
+      release_version: ${{ steps.ver.outputs.current }}
     steps:
       - name: Checkout main with full history + tags
         # Pinned to v4 (stable header-based credential helper). `token:` +
@@ -84,15 +89,17 @@ jobs:
         run: |
           set -euo pipefail
           CURRENT=$(awk '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{match($0, /"([^"]+)"/, a); print a[1]; exit}' Cargo.toml)
+          RELEASE_SHA=$(git rev-parse --verify 'HEAD^{commit}')
           IFS=. read -r X Y Z <<<"$CURRENT"
 
-          if   [ "$Z" -lt 9 ]; then NX=$X;        NY=$Y;        NZ=$((Z+1)); SHIFT=patch
+          if   [ "$Z" -lt 9 ]; then NX=$X;        NY=$Y;        NZ=$((Z+1)); SHIFT='patch'
           elif [ "$Y" -lt 9 ]; then NX=$X;        NY=$((Y+1)); NZ=0;        SHIFT=minor
           else                      NX=$((X+1)); NY=0;         NZ=0;        SHIFT=major
           fi
           NEXT="${NX}.${NY}.${NZ}"
 
           {
+            echo "release_sha=$RELEASE_SHA"
             echo "current=$CURRENT"
             echo "next=$NEXT"
             echo "shift=$SHIFT"
@@ -367,3 +374,22 @@ jobs:
           else
             echo "Milestone $OLD not found; nothing to roll."
           fi
+
+  # This job starts after the release job completes. It carries the release
+  # job's exact SHA, tag, and version so branch/version mutations cannot alter
+  # the publication checkout.
+  publish:
+    name: Publish exact release packages
+    needs: release
+    if: >-
+      needs.release.result == 'success' &&
+      needs.release.outputs.proceed == 'true'
+    permissions:
+      contents: read
+      deployments: write
+    uses: ./.github/workflows/cargo-publish.yml
+    with:
+      release_sha: ${{ needs.release.outputs.release_sha }}
+      release_tag: ${{ needs.release.outputs.release_tag }}
+      release_version: ${{ needs.release.outputs.release_version }}
+    secrets: inherit

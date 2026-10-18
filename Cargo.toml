@@ -13,11 +13,11 @@ authors = ["FL03 <joe@pzzld.org>"]
 categories = []
 description = "A client library for interacting with Polymarket."
 edition = "2024"
-homepage = "https://github.com/FL03/rspm/wiki"
-keywords = []
+homepage = "https://github.com/pzzld-org/rspm/wiki"
+keywords = ["polymarket", "sdk"]
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/FL03/rspm.git"
+repository = "https://github.com/pzzld-org/rspm.git"
 rust-version = "1.98.0"
 version = "0.0.2"
 
@@ -76,11 +76,11 @@ serde_derive = { version = "1" }
 serde_json = { default-features = false, version = "1" }
 serde_path_to_error = { version = "0.1" }
 # polymarket
-polymarket_client_sdk_v2 = { path = "patches/polymarket_client_sdk_v2", version = "0.7" }
+polymarket_client_sdk_v2 = { version = "0.8" }
 # WebAssembly
 wasm-bindgen = { default-features = false, version = "0.2" }
 # WebAssembly System Interface
-wit-bindgen = { default-features = false, version = "0.61" }
+wit-bindgen = { default-features = false, version = "0.63" }
 # tracing
 tracing = { default-features = false, features = ["attributes"], version = "0.1" }
 

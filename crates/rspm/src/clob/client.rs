@@ -173,7 +173,7 @@ pub struct ClobClient {
 const MAX_CLIENT_MARKER_BYTES: usize = 128;
 
 /// A signed CLOB order prepared without sending an order POST.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PreparedClobOrder {
     signed: SignedOrder,
     client_marker: String,
@@ -675,7 +675,7 @@ impl ClobClient {
             attempt_authority,
             self.submission_controller_binding,
             permit.authority,
-            guard.post_order_initial(signed),
+            guard.post_order(signed),
         )
         .await
         .map_err(|()| {
@@ -754,7 +754,7 @@ impl ClobClient {
             attempt_authority,
             self.submission_controller_binding,
             permit.authority,
-            guard.post_order_initial(signed),
+            guard.post_order(signed),
         )
         .await
         .map_err(|()| {
@@ -1309,21 +1309,20 @@ impl ClobClient {
     /// Submit one prepared payload with bounded authorization-aware retries.
     pub async fn submit_prepared<A, Authorization>(
         &self,
-        order: PreparedClobOrder,
+        PreparedClobOrder { signed, provider_order_id, .. }: PreparedClobOrder,
         authorize_attempt: A,
     ) -> core::result::Result<Option<String>, crate::ClobOperationError>
     where
         A: FnMut() -> Authorization,
         Authorization: core::future::Future<Output = Option<SubmissionAttemptAuthority>>,
     {
-        let expected_order_id = order.provider_order_id.clone();
+        let expected_order_id = provider_order_id.clone();
         let response = retry_post_order(
             "submit_prepared",
             crate::retry::RetryPolicy::default(),
             authorize_attempt,
             || self.submission_gate().permit().is_some(),
             |attempt_authority| {
-                let signed = order.signed.clone();
                 let expected_order_id = expected_order_id.clone();
                 async move {
                     let _submission = self.submission_serial.lock().await;

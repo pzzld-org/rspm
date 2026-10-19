@@ -76,11 +76,11 @@ serde_derive = { version = "1" }
 serde_json = { default-features = false, version = "1" }
 serde_path_to_error = { version = "0.1" }
 # polymarket
-polymarket_client_sdk_v2 = { version = "0.8" }
+polymarket_client_sdk_v2 = { default-features = false, path = "patches/polymarket_client_sdk_v2", version = "0.7.0" } # upgrade to 0.8
 # WebAssembly
 wasm-bindgen = { default-features = false, version = "0.2" }
 # WebAssembly System Interface
-wit-bindgen = { default-features = false, version = "0.63" }
+wit-bindgen = { default-features = false, version = "0.63.0" }
 # tracing
 tracing = { default-features = false, features = ["attributes"], version = "0.1" }
 

@@ -72,7 +72,7 @@ jobs:
             echo "RUSTFLAGS=-C panic=abort -Z panic_abort_tests" >> $GITHUB_ENV
           fi
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       - name: Setup rust-cache
         uses: swatinem/rust-cache@v2
         with:

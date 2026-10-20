@@ -35,6 +35,8 @@ pub mod error;
 pub mod fees;
 #[cfg(feature = "gamma")]
 pub mod gamma;
+#[cfg(feature = "market-channel")]
+pub mod market_channel;
 #[cfg(feature = "clob")]
 pub mod retry;
 #[cfg(feature = "watch")]

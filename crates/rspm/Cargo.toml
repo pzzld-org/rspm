@@ -113,6 +113,7 @@ full = [
   "default",
   "config",
   "json",
+  "market-channel",
   "stream",
   "tracing",
   "uuid",
@@ -150,6 +151,22 @@ json = [
   "serde",
   "serde_json",
   "reqwest?/json",
+]
+
+# Self-contained native market channel: no SDK, CLOB or ws capability.
+market-channel = [
+  "std",
+  "serde",
+  "serde_json",
+  "tokio",
+  "dep:tokio-tungstenite",
+  "tokio?/macros",
+  "tokio?/net",
+  "tokio?/rt",
+  "tokio?/sync",
+  "tokio?/time",
+  "tokio-tungstenite?/connect",
+  "tokio-tungstenite?/rustls-tls-native-roots",
 ]
 
 multi-thread = [

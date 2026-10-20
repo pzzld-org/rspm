@@ -15,6 +15,7 @@ pub use self::prelude::*;
 
 pub mod client;
 mod consts;
+pub mod sprint;
 
 mod utils {
     #[doc(inline)]

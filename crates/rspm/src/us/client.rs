@@ -79,35 +79,51 @@ impl UsClient {
 
     /// `GET /v1/markets`.
     pub async fn markets(&self, q: &UsMarketsQuery) -> Result<Vec<UsMarket>> {
-        let url = endpoint(&self.gateway_base, &["v1", "markets"], &market_query(q))?;
-        Ok(self.get::<MarketsPage>(url, false).await?.markets)
+        let text = self
+            .gateway_get_text(&["v1", "markets"], &market_query(q))
+            .await?;
+        Ok(decode::<MarketsPage>(&text)?.markets)
     }
 
     /// `GET /v1/market/slug/{slug}`.
     pub async fn market_by_slug(&self, slug: &str) -> Result<UsMarket> {
-        let url = endpoint(&self.gateway_base, &["v1", "market", "slug", slug], &[])?;
-        Ok(self.get::<MarketEnvelope>(url, false).await?.market)
+        let text = self
+            .gateway_get_text(&["v1", "market", "slug", slug], &[])
+            .await?;
+        Ok(decode::<MarketEnvelope>(&text)?.market)
     }
 
     /// `GET /v1/markets/{slug}/book`.
     pub async fn book(&self, slug: &str) -> Result<UsMarketData> {
-        let url = endpoint(&self.gateway_base, &["v1", "markets", slug, "book"], &[])?;
-        Ok(self.get::<BookEnvelope>(url, false).await?.market_data)
+        let text = self
+            .gateway_get_text(&["v1", "markets", slug, "book"], &[])
+            .await?;
+        Ok(decode::<BookEnvelope>(&text)?.market_data)
     }
 
     /// `GET /v1/markets/{slug}/settlement`. Returns `None` on 404, which the
     /// API uses for both "not found" and "not settled yet".
     pub async fn settlement(&self, slug: &str) -> Result<Option<Decimal>> {
-        let url = endpoint(
-            &self.gateway_base,
-            &["v1", "markets", slug, "settlement"],
-            &[],
-        )?;
+        let text = match self
+            .gateway_get_text(&["v1", "markets", slug, "settlement"], &[])
+            .await
+        {
+            Err(Error::NotFound) => return Ok(None),
+            result => result?,
+        };
+        Ok(decode::<SettlementEnvelope>(&text)?.settlement)
+    }
+
+    /// `GET` a gateway path and return the body text, unchanged. Status and
+    /// error mapping are the same as the typed gateway calls.
+    pub async fn gateway_get_text(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<String> {
+        let url = endpoint(&self.gateway_base, segments, query)?;
         let response = self.request(Method::GET, &url, false)?.send().await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        Ok(read::<SettlementEnvelope>(response).await?.settlement)
+        read_text(response).await
     }
 
     // authenticated
@@ -273,8 +289,8 @@ fn market_query(q: &UsMarketsQuery) -> Vec<(&'static str, String)> {
     query
 }
 
-/// Decode a response body. Success carries JSON; an empty body means `{}`.
-async fn read<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+/// The body text of a successful response, or the mapped error.
+async fn read_text(response: reqwest::Response) -> Result<String> {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -284,10 +300,20 @@ async fn read<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
         .map(Duration::from_secs);
     let body = response.text().await?;
     if status.is_success() {
-        let json = if body.trim().is_empty() { "{}" } else { &body };
-        return Ok(serde_json::from_str(json)?);
+        return Ok(body);
     }
     Err(status_error(status, retry_after, &body))
+}
+
+/// Decode a JSON body. An empty body means `{}`.
+fn decode<T: DeserializeOwned>(body: &str) -> Result<T> {
+    let json = if body.trim().is_empty() { "{}" } else { body };
+    Ok(serde_json::from_str(json)?)
+}
+
+/// Read and decode a response body. Success carries JSON.
+async fn read<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    decode(&read_text(response).await?)
 }
 
 fn status_error(status: StatusCode, retry_after: Option<Duration>, body: &str) -> Error {

@@ -17,8 +17,8 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 use rspm::{
     Error,
     us::{
-        Amount, CreateOrderRequest, UsClient, UsMarketsQuery, UsOrderIntent, UsOutcome, UsSigner,
-        UsSubscription, UsTimeInForce, UsWs, UsWsChannel, UsWsEvent, is_us_token_id,
+        Amount, CreateOrderRequest, UsClient, UsMarket, UsMarketsQuery, UsOrderIntent, UsOutcome,
+        UsSigner, UsSubscription, UsTimeInForce, UsWs, UsWsChannel, UsWsEvent, is_us_token_id,
         parse_us_token_id, us_token_id,
     },
 };
@@ -670,12 +670,11 @@ async fn rest_errors_map_to_rspm_errors_and_post_is_never_retried() {
 #[tokio::test]
 async fn gateway_reads_decode_real_market_and_book_shapes() {
     let market: Value = serde_json::from_str(MARKET_FIXTURE).expect("market fixture");
-    let market_envelope = market.clone();
     let markets_page = json!({"markets": [market["market"].clone()]});
     let (base, log) = serve_http(
         move |request| match (request.method.as_str(), request.path()) {
             ("GET", path) if path == format!("/v1/market/slug/{MARKET_SLUG}") => {
-                Reply::json(200, market_envelope.clone())
+                Reply::json_str(200, MARKET_FIXTURE)
             }
             ("GET", path) if path == format!("/v1/markets/{MARKET_SLUG}/book") => {
                 Reply::json_str(200, BOOK_FIXTURE)
@@ -688,6 +687,14 @@ async fn gateway_reads_decode_real_market_and_book_shapes() {
     let client = UsClient::public().with_bases(base.clone(), base);
 
     let found = client.market_by_slug(MARKET_SLUG).await.expect("market");
+    let text = client
+        .gateway_get_text(&["v1", "market", "slug", MARKET_SLUG], &[])
+        .await
+        .expect("market text");
+    assert_eq!(text, MARKET_FIXTURE);
+    let envelope: Value = serde_json::from_str(&text).expect("market envelope");
+    let decoded: UsMarket = serde_json::from_value(envelope["market"].clone()).expect("market");
+    assert_eq!(format!("{decoded:?}"), format!("{found:?}"));
     assert_eq!(found.slug, MARKET_SLUG);
     assert_eq!(found.status, "MARKET_STATUS_OPEN");
     assert_eq!(found.minimum_trade_qty, Some(0.01));

@@ -114,8 +114,9 @@ impl UsClient {
         Ok(decode::<SettlementEnvelope>(&text)?.settlement)
     }
 
-    /// `GET` a gateway path and return the body text, unchanged. Status and
-    /// error mapping are the same as the typed gateway calls.
+    /// `GET` a gateway path and return the body as text. The body goes through
+    /// `Response::text`, so invalid UTF-8 is replaced, not kept byte for byte.
+    /// Status and error mapping are the same as the typed gateway calls.
     pub async fn gateway_get_text(
         &self,
         segments: &[&str],

@@ -2,14 +2,26 @@ name: cargo-publish
 
 concurrency:
   cancel-in-progress: false
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: rspm-registry-publication
 
 on:
+  workflow_call:
+    inputs:
+      release_sha: { required: true, type: string }
+      release_tag: { required: true, type: string }
+      release_version: { required: true, type: string }
+    secrets:
+      CARGO_REGISTRY_TOKEN: { required: false }
   release:
     types: [published]
   repository_dispatch:
     types: [crates-io, cargo-publish]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact release tag; empty derives one semver tag from selected HEAD.
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,27 +35,105 @@ jobs:
       deployments: write
     environment:
       name: crates-io
-      url: https://crates.io/crates/${{ matrix.package }}
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        package:
-          - rspm
-          - rspm-core
+      url: https://crates.io/crates/rspm
     steps:
-      - name: Checkout
+      - name: Checkout exact release subject
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.client_payload.ref || github.ref }}
+          fetch-tags: true
+          ref: ${{ inputs.release_sha || inputs.release_tag || github.event.release.tag_name || github.event.client_payload.ref || github.ref }}
           repository: ${{ github.event.client_payload.repository || github.repository }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Publish (${{ matrix.package }})
-        run: cargo publish --locked --package ${{ matrix.package }}
+
+      - name: Verify identity and publish rspm
         env:
+          RELEASE_SHA_INPUT: ${{ inputs.release_sha }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag || github.event.release.tag_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.release_version }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          HEAD_SHA=$(git rev-parse --verify 'HEAD^{commit}')
+          if [ -n "${RELEASE_TAG_INPUT:-}" ]; then
+            RELEASE_TAG=$RELEASE_TAG_INPUT
+          else
+            HEAD_TAGS=()
+            while IFS= read -r tag; do HEAD_TAGS+=("$tag"); done < <(git tag --points-at "$HEAD_SHA" 'v*' | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/')
+            [ "${#HEAD_TAGS[@]}" -eq 1 ] || fail "expected exactly one semver release tag at HEAD, found ${#HEAD_TAGS[@]}"
+            RELEASE_TAG=${HEAD_TAGS[0]}
+          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release tag is not exact semver: $RELEASE_TAG"
+          RELEASE_VERSION="${RELEASE_VERSION_INPUT:-${RELEASE_TAG#v}}"
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release version is not exact semver: $RELEASE_VERSION"
+          TAG_SHA=$(git rev-parse --verify "${RELEASE_TAG}^{commit}")
+          RELEASE_SHA="${RELEASE_SHA_INPUT:-$TAG_SHA}"
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]+$ ]] || [ "${#RELEASE_SHA}" -ne 40 ]; then
+            fail "release SHA is not full lowercase SHA: $RELEASE_SHA"
+          fi
+          if [ "$HEAD_SHA" != "$RELEASE_SHA" ] || [ "$TAG_SHA" != "$RELEASE_SHA" ] || [ "$RELEASE_TAG" != "v${RELEASE_VERSION}" ]; then
+            fail "release identity mismatch: HEAD=$HEAD_SHA tag=$TAG_SHA supplied=$RELEASE_SHA tag_name=$RELEASE_TAG version=$RELEASE_VERSION"
+          fi
+
+          WORKSPACE_VERSION=$(awk '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{print $3; exit}' Cargo.toml | tr -d '"')
+          if [ "$WORKSPACE_VERSION" != "$RELEASE_VERSION" ] || [ ! -f Cargo.lock ]; then
+            fail "workspace version or locked workspace is invalid"
+          fi
+
+          METADATA="${RUNNER_TEMP}/rspm-metadata.json"
+          cargo metadata --locked --no-deps --format-version 1 > "$METADATA"
+          PACKAGE=rspm
+          PUBLISHABLE=$(jq -r '.packages[] | select(.publish == null or ((.publish | index("crates-io")) != null)) | .name' "$METADATA")
+          PACKAGE_COUNT=$(jq -r --arg package "$PACKAGE" '[.packages[] | select(.name == $package)] | length' "$METADATA")
+          PACKAGE_VERSION=$(jq -r --arg package "$PACKAGE" '.packages[] | select(.name == $package) | .version' "$METADATA")
+          PACKAGE_PUBLISH=$(jq -r --arg package "$PACKAGE" '.packages[] | select(.name == $package) | if .publish == null or ((.publish | index("crates-io")) != null) then "enabled" else "disabled" end' "$METADATA")
+          if [ "$PUBLISHABLE" != "$PACKAGE" ] || [ "$PACKAGE_COUNT" -ne 1 ] || [ "$PACKAGE_VERSION" != "$RELEASE_VERSION" ] || [ "$PACKAGE_PUBLISH" != enabled ]; then
+            fail "workspace package census or publish identity is invalid"
+          fi
+
+          registry_version() {
+            local package=$1 version=$2
+            local response="${RUNNER_TEMP}/crates-io-${package}-${version}.json" status
+            if ! status=$(curl --silent --show-error --location --connect-timeout 5 --max-time 15 --output "$response" --write-out '%{http_code}' "https://crates.io/api/v1/crates/${package}/${version}"); then return 2; fi
+            case "$status" in
+              200) jq -e --arg package "$package" --arg version "$version" '(.version.crate == $package) and (.version.num == $version)' "$response" >/dev/null && return 0 || return 2 ;;
+              404) return 1 ;;
+              *) return 2 ;;
+            esac
+          }
+
+          set +e
+          registry_version "$PACKAGE" "$RELEASE_VERSION"
+          PRECHECK_STATUS=$?
+          set -e
+          if [ "$PRECHECK_STATUS" -eq 0 ]; then
+            echo "$PACKAGE $RELEASE_VERSION already exists on crates.io; skipping publication."
+            exit 0
+          fi
+          [ "$PRECHECK_STATUS" -eq 1 ] || fail "could not prove $PACKAGE $RELEASE_VERSION is absent from crates.io"
+
+          cargo publish --dry-run --locked --package "$PACKAGE"
+          set +e
+          cargo publish --locked --package "$PACKAGE"
+          PUBLISH_STATUS=$?
+          set -e
+
+          POSTCHECK_STATUS=1
+          for attempt in 1 2 3 4 5; do
+            set +e
+            registry_version "$PACKAGE" "$RELEASE_VERSION"
+            POSTCHECK_STATUS=$?
+            set -e
+            [ "$POSTCHECK_STATUS" -eq 0 ] && break
+            [ "$POSTCHECK_STATUS" -eq 1 ] && [ "$attempt" -lt 5 ] || break
+            sleep 5
+          done
+          [ "$POSTCHECK_STATUS" -eq 0 ] || fail "publish status $PUBLISH_STATUS did not make $PACKAGE $RELEASE_VERSION visible on crates.io"
+          echo "Verified $PACKAGE $RELEASE_VERSION on crates.io (publish status $PUBLISH_STATUS)."

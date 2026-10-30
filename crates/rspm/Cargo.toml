@@ -2,7 +2,6 @@
 build = "build.rs"
 description = "Custom Polymarket utilities and primitives supporting integration into the axiom pipeline"
 name = "rspm"
-publish = false
 
 authors.workspace = true
 categories.workspace = true
@@ -33,6 +32,11 @@ name = "refresh_balance"
 path = "examples/refresh_balance.rs"
 required-features = ["clob"]
 
+[[example]]
+name = "us_smoke"
+path = "examples/us_smoke.rs"
+required-features = ["us"]
+
 [[test]]
 name = "empty_fee_rate_response"
 path = "tests/empty_fee_rate_response.rs"
@@ -47,6 +51,11 @@ required-features = ["json"]
 name = "workspace_architecture_contract"
 path = "tests/workspace_architecture_contract.rs"
 required-features = ["alloc"]
+
+[[test]]
+name = "us_e2e"
+path = "tests/us_e2e.rs"
+required-features = ["us", "test-utils"]
 
 [dependencies]
 # error
@@ -82,6 +91,7 @@ tracing = { optional = true, workspace = true }
 strum = { workspace = true }
 # crypto
 k256 = { workspace = true }
+ring = { optional = true, workspace = true }
 rust_decimal = { workspace = true }
 base64 = { optional = true, workspace = true }
 hmac = { optional = true, workspace = true }
@@ -161,6 +171,23 @@ multi-thread = [
 native = [
   "multi-thread",
   "tokio?/full",
+]
+
+us = [
+  "std",
+  "async",
+  "json",
+  "base64",
+  "url",
+  "dep:ring",
+  "dep:tokio-tungstenite",
+  "tokio?/net",
+  "tokio?/rt",
+  "tokio?/sync",
+  "tokio?/time",
+  "tokio?/macros",
+  "tokio-tungstenite?/connect",
+  "tokio-tungstenite?/rustls-tls-native-roots",
 ]
 
 watch = [

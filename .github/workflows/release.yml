@@ -215,7 +215,9 @@ jobs:
               -e "/path = \"crates\//s/version = \"${CURRENT}\"/version = \"${NEXT}\"/" \
               Cargo.toml
             rm -f Cargo.toml.bak
-            echo "  bumped Cargo.toml"
+            # Members inherit version.workspace, so their Cargo.lock entries move too; --locked jobs need them.
+            cargo update --workspace
+            echo "  bumped Cargo.toml and Cargo.lock"
           fi
 
           # ── Nix: bump version in flake.nix and default.nix ──
@@ -267,9 +269,9 @@ jobs:
         run: |
           set -euo pipefail
           # Stage only the files the bump step explicitly modified — never `git add -A`.
-          # .artifacts/, lock files, and unrelated tracked/untracked files must not ride
-          # this commit.
-          git add Cargo.toml
+          # .artifacts/, other lock files, and unrelated tracked/untracked files must not ride
+          # this commit. Cargo.lock carries only the workspace members' new version.
+          git add Cargo.toml Cargo.lock
           for f in flake.nix default.nix README.md; do
             [ -f "$f" ] && git add "$f" || true
           done

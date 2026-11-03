@@ -33,7 +33,7 @@ on:
         default: ubuntu-latest
         description: What type of runner should the action leverage?
         type: choice
-        options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
+        options: [macos-latest, ubuntu-latest]
 
 concurrency:
   group: gitflow-${{ github.ref }}

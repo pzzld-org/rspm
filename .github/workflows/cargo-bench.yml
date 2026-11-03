@@ -20,10 +20,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        default: self-hosted
+        default: ubuntu-latest
         description: What type of runner should the action leverage?
         type: choice
-        options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
+        options: [macos-latest, ubuntu-latest]
       target:
         default: x86_64-unknown-linux-gnu
         description: "Select the target to compile for"
@@ -51,8 +51,7 @@ jobs:
       SCCACHE_GHA_ENABLED: true
     permissions:
       actions: write
-      checks: write
-      contents: write
+      contents: read
     outputs:
       id: ${{ steps.artifacts.outputs.artifact-id }}
       digest: ${{ steps.artifacts.outputs.artifact-digest }}

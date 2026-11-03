@@ -6,7 +6,6 @@ concurrency:
 
 on:
   pull_request:
-    types: [synchronize]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -21,10 +20,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        default: self-hosted
+        default: ubuntu-latest
         description: What type of runner should the action leverage?
         type: choice
-        options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
+        options: [macos-latest, ubuntu-latest]
 
 permissions:
   contents: read
@@ -41,7 +40,6 @@ jobs:
       actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
       contents: read
       security-events: write
-      statuses: write
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +65,8 @@ jobs:
         with:
           tool: clippy-sarif sarif-fmt
       - name: Run cargo clippy
+        # shell: bash adds pipefail, so a clippy failure fails the step behind the SARIF pipe
+        shell: bash
         run: |
           cargo clippy --all-targets --locked --workspace \
             --message-format=json \

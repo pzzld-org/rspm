@@ -211,6 +211,21 @@ removal criteria.
 
 ## Contributing
 
+### Gates
+
+Formatting, clippy, tests, doctests and the build run locally with
+[Dagger](https://docs.dagger.io/install), from the shared `pzzld-org/dagger`
+rust module that `dagger.toml` installs. They run over the default and `full`
+features:
+
+```bash
+dagger check -j 1
+```
+
+`git config core.hooksPath .githooks` makes `.githooks/pre-push` run them before
+every push. GitHub Actions runs only release and artifact workflows (pzzld-org/root
+`CI.md`).
+
 ### Rust test placement
 
 Keep private unit tests literally inline with the implementation in a

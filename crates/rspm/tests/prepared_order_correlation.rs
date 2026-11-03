@@ -581,8 +581,8 @@ fn manual_keccak256(input: &[u8]) -> [u8; 32] {
     padded.push(0x80);
 
     let mut state = [0_u64; 25];
-    for block in padded.chunks_exact(RATE) {
-        for (lane, bytes) in block.chunks_exact(8).enumerate() {
+    for block in padded.as_chunks::<RATE>().0 {
+        for (lane, bytes) in block.as_chunks::<8>().0.iter().enumerate() {
             let mut lane_bytes = [0_u8; 8];
             lane_bytes.copy_from_slice(bytes);
             state[lane] ^= u64::from_le_bytes(lane_bytes);
@@ -591,7 +591,7 @@ fn manual_keccak256(input: &[u8]) -> [u8; 32] {
     }
 
     let mut output = [0_u8; 32];
-    for (lane, bytes) in output.chunks_exact_mut(8).enumerate() {
+    for (lane, bytes) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         bytes.copy_from_slice(&state[lane].to_le_bytes());
     }
     output
@@ -627,7 +627,9 @@ fn hex_bytes(value: &str, byte_len: usize, field: &str) -> Vec<u8> {
         "{field} hexadecimal form mismatch"
     );
     digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
 }

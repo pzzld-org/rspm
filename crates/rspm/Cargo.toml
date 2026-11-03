@@ -38,6 +38,12 @@ name = "empty_fee_rate_response"
 path = "tests/empty_fee_rate_response.rs"
 required-features = ["clob", "json"]
 
+# The fake CLOB server listens on loopback, which only test-utils accepts.
+[[test]]
+name = "prepared_order_correlation"
+path = "tests/prepared_order_correlation.rs"
+required-features = ["clob", "test-utils"]
+
 [[test]]
 name = "wallet_address_contract"
 path = "tests/wallet_address_contract.rs"

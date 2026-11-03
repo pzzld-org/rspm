@@ -4,10 +4,14 @@ on:
   pull_request:
     types: [ closed ]
 
+permissions:
+  contents: read
+
 jobs:
   cache_cleanup:
     name: "Cleanup: Pull-Request Cache"
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       actions: write
       contents: read

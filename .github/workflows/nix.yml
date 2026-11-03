@@ -12,14 +12,16 @@ on:
     types: [nix, nix-build]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    continue-on-error: true
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:

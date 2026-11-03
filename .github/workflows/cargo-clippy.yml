@@ -6,7 +6,6 @@ concurrency:
 
 on:
   pull_request:
-    types: [synchronize]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -21,14 +20,18 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        default: self-hosted
+        default: ubuntu-latest
         description: What type of runner should the action leverage?
         type: choice
-        options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
+        options: [macos-latest, ubuntu-latest]
+
+permissions:
+  contents: read
 
 jobs:
   clippy:
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
     env:
       CACHE_ON_FAILURE: true
       CARGO_TERM_COLOR: always
@@ -37,14 +40,13 @@ jobs:
       actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
       contents: read
       security-events: write
-      statuses: write
     strategy:
       fail-fast: false
       matrix:
         features: [default, full]
         include:
-          - target: stable
-            toolchain: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            toolchain: stable
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -52,7 +54,6 @@ jobs:
           fetch-depth: 1
           fetch-tags: true
           repository: ${{ github.repository }}
-          ref: ${{ github.event.client_payload.ref || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -64,6 +65,8 @@ jobs:
         with:
           tool: clippy-sarif sarif-fmt
       - name: Run cargo clippy
+        # shell: bash adds pipefail, so a clippy failure fails the step behind the SARIF pipe
+        shell: bash
         run: |
           cargo clippy --all-targets --locked --workspace \
             --message-format=json \

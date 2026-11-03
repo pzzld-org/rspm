@@ -30,10 +30,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        default: self-hosted
+        default: ubuntu-latest
         description: What type of runner should the action leverage?
         type: choice
-        options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
+        options: [macos-latest, ubuntu-latest]
 
 concurrency:
   group: gitflow-${{ github.ref }}
@@ -46,7 +46,8 @@ permissions:
 jobs:
   draft-sprint-pr:
     name: Draft PR (dev → patch)
-    runs-on: ${{ github.event.inputs.runner || 'self-hosted' }}
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 15
     steps:
       - name: Open draft PR  dev → patch
         env:

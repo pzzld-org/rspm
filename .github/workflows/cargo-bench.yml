@@ -20,10 +20,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        default: self-hosted
+        default: ubuntu-latest
         description: What type of runner should the action leverage?
         type: choice
-        options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
+        options: [macos-latest, ubuntu-latest]
       target:
         default: x86_64-unknown-linux-gnu
         description: "Select the target to compile for"
@@ -35,9 +35,13 @@ on:
         type: choice
         options: [stable, nightly]
 
+permissions:
+  contents: read
+
 jobs:
   benchmark:
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
     env:
       CACHE_ON_FAILURE: true
       CARGO_TERM_COLOR: always
@@ -47,8 +51,7 @@ jobs:
       SCCACHE_GHA_ENABLED: true
     permissions:
       actions: write
-      checks: write
-      contents: write
+      contents: read
     outputs:
       id: ${{ steps.artifacts.outputs.artifact-id }}
       digest: ${{ steps.artifacts.outputs.artifact-digest }}
@@ -66,7 +69,6 @@ jobs:
         with:
           fetch-depth: 1
           fetch-tags: true
-          ref: ${{ github.event.client_payload.ref  || github.ref }}
           repository: ${{ github.repository }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Prepare the workflow

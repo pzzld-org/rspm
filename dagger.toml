@@ -1,0 +1,5 @@
+[modules.rust]
+source = "github.com/pzzld-org/dagger/rust@main"
+
+[modules.rust.settings]
+features = ["", "--features full,test-utils"]

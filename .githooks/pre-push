@@ -1,38 +1,55 @@
 #!/usr/bin/env bash
-# pre-push — dispatch to open-sprint-pr.
+# pre-push: run the Dagger gates, then dispatch to open-sprint-pr.
 #
-# WHY THIS FILE EXISTS. `.githooks/open-sprint-pr` was tracked, executable, and
-# never ran: `core.hooksPath` was unset, so git looked in `.git/hooks/` (samples
-# only), and even pointed at `.githooks/` the name `open-sprint-pr` is not a git
-# hook name. Git has a fixed vocabulary of hook filenames; anything else is an
-# inert script sitting in a hooks directory. So the repo carried a hook-shaped
-# file that no git operation could ever invoke.
-#
-# WHY pre-push AND NOT pre-commit. open-sprint-pr requires the branch to already
-# exist on the remote -- it calls `git ls-remote --exit-code --heads` at :61 and
-# exits early when the branch is absent. A pre-commit hook runs before any push
-# has happened, so on a fresh sprint branch it would take that early exit every
-# time and never open anything. It also shells out to `gh api` over the network,
-# which is the wrong cost to pay on every commit.
-#
-# pre-push is the only client-side push hook git offers. Running open-sprint-pr
-# here means: first push creates the branch remotely and the hook takes its
-# early exit; every subsequent push finds the branch and opens the draft PR if
-# one is not already open. That is one push of latency, and it is the closest
-# git gets to "after push" without a server-side hook.
+# The gates are `dagger check`: fmt, clippy, nextest, doctests and build from the shared
+# pzzld-org/dagger rust module (dagger.toml). They replace the cargo-build, cargo-test and
+# cargo-clippy pull_request workflows (pzzld-org/root CI.md). A failing gate refuses the push.
 #
 # NOT ENABLED BY DEFAULT. This file does nothing until someone sets
 #   git config core.hooksPath .githooks
-# which is LOCAL config and cannot be committed. That is deliberate: turning it
-# on causes an outward-facing action (opening a PR on GitHub), so it is the
-# operator's switch to throw, not something a clone silently inherits.
+# which is LOCAL config and cannot be committed. Turning it on also lets open-sprint-pr open a
+# draft PR on GitHub, so it is the operator's switch to throw, not something a clone inherits.
 #
-# There is deliberately NO test-running pre-commit hook in this repo. Gate tests
-# run at step boundaries and before pushes -- see AGENTS.md.
+# open-sprint-pr runs here because it needs the branch to exist remotely (git ls-remote), so the
+# first push of a sprint branch skips and later pushes open the draft. git has no post-push hook.
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPRINT_PR="$HOOK_DIR/open-sprint-pr"
+ZERO=0000000000000000000000000000000000000000
+
+updates=$(mktemp)
+trap 'rm -f "$updates"' EXIT
+cat > "$updates"
+
+# dagger check gates the working tree, so that tree must be exactly the commit being pushed.
+head=$(git rev-parse HEAD)
+gate=false
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  [[ "$local_sha" == "$ZERO" ]] && continue
+  commit=$(git rev-parse "$local_sha^{commit}")
+  if [[ "$commit" != "$head" ]]; then
+    echo "pre-push: pushing $commit but HEAD is $head; check out the pushed commit so dagger check gates it." >&2
+    exit 1
+  fi
+  gate=true
+done < "$updates"
+
+if $gate; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "pre-push: uncommitted changes; dagger check would gate them, not the pushed commit. Commit or stash first." >&2
+    exit 1
+  fi
+  command -v dagger >/dev/null 2>&1 || {
+    echo "pre-push: dagger is required for the gates (https://docs.dagger.io/install)." >&2
+    exit 1
+  }
+  cd "$(git rev-parse --show-toplevel)"
+  DAGGER_NO_NAG=1 dagger check -j 1 < /dev/null || {
+    echo "pre-push: dagger check failed; refusing the push." >&2
+    exit 1
+  }
+fi
 
 [ -x "$SPRINT_PR" ] || exit 0
 

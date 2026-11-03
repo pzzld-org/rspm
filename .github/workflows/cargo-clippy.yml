@@ -26,9 +26,13 @@ on:
         type: choice
         options: [macos-latest, ubuntu-latest, windows-latest, self-hosted]
 
+permissions:
+  contents: read
+
 jobs:
   clippy:
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
     env:
       CACHE_ON_FAILURE: true
       CARGO_TERM_COLOR: always
@@ -43,8 +47,8 @@ jobs:
       matrix:
         features: [default, full]
         include:
-          - target: stable
-            toolchain: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            toolchain: stable
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -52,7 +56,6 @@ jobs:
           fetch-depth: 1
           fetch-tags: true
           repository: ${{ github.repository }}
-          ref: ${{ github.event.client_payload.ref || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1

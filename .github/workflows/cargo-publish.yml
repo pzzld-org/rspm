@@ -7,17 +7,19 @@ concurrency:
 on:
   release:
     types: [published]
-  repository_dispatch:
-    types: [crates-io, cargo-publish]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
 
+permissions:
+  contents: read
+
 jobs:
   crates-io:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       deployments: write
@@ -30,14 +32,11 @@ jobs:
       matrix:
         package:
           - rspm
-          - rspm-core
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.client_payload.ref || github.ref }}
-          repository: ${{ github.event.client_payload.repository || github.repository }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1

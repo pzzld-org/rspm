@@ -37,10 +37,14 @@ on:
         type: choice
         options: [ stable, nightly ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test the workspace
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
     env:
       CACHE_ON_FAILURE: true
       CARGO_TERM_COLOR: always
@@ -63,7 +67,6 @@ jobs:
         with:
           fetch-depth: 1
           fetch-tags: true
-          ref: ${{ github.event.client_payload.ref  || github.ref }}
           repository: ${{ github.repository }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Prepare the workflow

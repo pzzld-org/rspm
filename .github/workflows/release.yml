@@ -21,10 +21,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   release:
     name: Patch release pipeline
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       discussions: write
@@ -200,14 +204,15 @@ jobs:
             git checkout -b "$PATCH" main
           fi
 
-          # ── Rust: bump [workspace.package] version + all inline axiom-* dep pins ──
+          # ── Rust: bump [workspace.package] version + this workspace's own crate pins ──
           # Two targeted sed expressions:
           #   1. exact-line match catches `version = "X.Y.Z"` in [workspace.package]
-          #   2. axiom-line match catches `axiom-foo = { ..., version = "X.Y.Z" }`
+          #   2. path-line match catches `foo = { ..., path = "crates/foo", version = "X.Y.Z" }`
+          #      in [workspace.dependencies]: this workspace's member crates only (patches/ is vendored)
           if [ -f Cargo.toml ]; then
             sed -i.bak \
               -e "s/^version = \"${CURRENT}\"$/version = \"${NEXT}\"/" \
-              -e "/axiom/s/version = \"${CURRENT}\"/version = \"${NEXT}\"/" \
+              -e "/path = \"crates\//s/version = \"${CURRENT}\"/version = \"${NEXT}\"/" \
               Cargo.toml
             rm -f Cargo.toml.bak
             echo "  bumped Cargo.toml"

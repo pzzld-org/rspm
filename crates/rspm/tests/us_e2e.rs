@@ -7,19 +7,24 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::prelude::{BASE64_STANDARD, Engine as _};
+use chrono::{DateTime, SecondsFormat};
 use futures::{SinkExt as _, StreamExt as _};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 use rspm::{
     Error,
     us::{
-        Amount, CreateOrderRequest, UsClient, UsMarket, UsMarketsQuery, UsOrderIntent, UsOutcome,
-        UsSigner, UsSubscription, UsTimeInForce, UsWs, UsWsChannel, UsWsEvent, is_us_token_id,
-        parse_us_token_id, us_token_id,
+        Amount, CreateOrderRequest, UsBookStamp, UsClient, UsHorizon, UsMarket, UsMarketsQuery,
+        UsOrderIntent, UsOutcome, UsPlane, UsPlaneEvent, UsSigner, UsStore, UsSubscription,
+        UsTimeInForce, UsWs, UsWsChannel, UsWsEvent, is_us_token_id, parse_us_token_id,
+        us_token_id,
     },
 };
 use rust_decimal::Decimal;
@@ -1097,4 +1102,427 @@ async fn ws_silence_past_idle_triggers_reconnect() {
     ws.shutdown().await;
     let replayed = server.await.expect("server task");
     assert_eq!(replayed, subscribe_frame("order-sub-1"));
+}
+
+// ---------------------------------------------------------------------------
+// Data plane
+// ---------------------------------------------------------------------------
+
+const PLANE_A: &str = "cpc-btc-updown-15m-test-a";
+const PLANE_B: &str = "cpc-btc-updown-5m-test-b";
+const PLANE_B2: &str = "cpc-btc-updown-5m-test-b2";
+const PLANE_C: &str = "cpc-btc-updown-5m-test-c";
+const PLANE_DOGE: &str = "cpc-doge-updown-5m-test-d";
+const PLANE_RESENT: &str = "2026-10-30T15:49:00.887703145Z";
+
+fn rfc3339(secs: i64) -> String {
+    DateTime::from_timestamp(secs, 0)
+        .expect("representable timestamp")
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// A gateway market in the `GET /v1/markets` shape.
+fn window_market(
+    slug: &str,
+    asset: &str,
+    horizon: &str,
+    start: i64,
+    sides: (&str, &str),
+    strike: Option<&str>,
+) -> Value {
+    let width = if horizon == "5m" { 300 } else { 900 };
+    json!({
+        "id": format!("id-{slug}"),
+        "slug": slug,
+        "status": "MARKET_STATUS_OPEN",
+        "minimumTradeQty": 0.01,
+        "feeCoefficient": 0.095,
+        "marketSides": [
+            {"id": sides.0, "long": true},
+            {"id": sides.1, "long": false}
+        ],
+        "assetPriceTerms": {
+            "marketType": "ASSET_PRICE_MARKET_TYPE_UP_DOWN",
+            "asset": {"symbol": asset},
+            "horizon": horizon,
+            "windowStart": rfc3339(start),
+            "windowEnd": rfc3339(start + width),
+            "priceToBeat": strike.map(|value| json!({"value": value, "currency": "USD"})),
+        }
+    })
+}
+
+/// A markets-WebSocket `marketData` frame.
+fn book_frame(
+    slug: &str,
+    bids: &[(&str, &str)],
+    offers: &[(&str, &str)],
+    transact: &str,
+) -> String {
+    let levels = |levels: &[(&str, &str)]| -> Vec<Value> {
+        levels
+            .iter()
+            .map(|(px, qty)| json!({"px": {"value": px, "currency": "USD"}, "qty": qty}))
+            .collect()
+    };
+    json!({
+        "marketData": {
+            "marketSlug": slug,
+            "bids": levels(bids),
+            "offers": levels(offers),
+            "state": "MARKET_STATE_OPEN",
+            "transactTime": transact,
+        }
+    })
+    .to_string()
+}
+
+/// A markets WebSocket that answers a subscribe with a heartbeat and the `books` of each market it
+/// names, except that it rejects the first subscription naming exactly `reject_once`. Every client
+/// frame is logged.
+async fn serve_plane_ws(
+    listener: TcpListener,
+    books: Vec<(&'static str, Vec<String>)>,
+    reject_once: &'static str,
+) -> Arc<Mutex<Vec<Value>>> {
+    let public_key = signer().public_key();
+    let log: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&log);
+    tokio::spawn(async move {
+        let (mut socket, _) = accept_signed(&listener, public_key).await;
+        let mut rejected = false;
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            let frame: Value = serde_json::from_str(text.as_str()).expect("client frame");
+            sink.lock().expect("frame log").push(frame.clone());
+            let Some(subscribe) = frame.get("subscribe") else {
+                continue;
+            };
+            let slugs: Vec<&str> = subscribe["marketSlugs"]
+                .as_array()
+                .expect("market slugs")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if !rejected && slugs == [reject_once] {
+                rejected = true;
+                let rejection = json!({
+                    "requestId": subscribe["requestId"],
+                    "error": "subscription temporarily unavailable",
+                });
+                socket
+                    .send(Message::text(rejection.to_string()))
+                    .await
+                    .expect("rejection");
+                continue;
+            }
+            let mut replies = vec![json!({"heartbeat": {}}).to_string()];
+            for (slug, frames) in &books {
+                if slugs.contains(slug) {
+                    replies.extend(frames.iter().cloned());
+                }
+            }
+            for reply in replies {
+                socket.send(Message::text(reply)).await.expect("book frame");
+            }
+        }
+    });
+    log
+}
+
+/// The data plane against loopback venue servers: discovery keeps Up/Down windows of the
+/// configured assets and skips markets it cannot decode, reports every body and frame raw, groups
+/// subscriptions by window, books only listed markets with a last-change stamp that holds across
+/// size-only resends, and reads strikes and fees into the store. The first pass lists the 15m
+/// market A, 5m market B and a later 5m window C, and the venue rejects C's lone subscription once.
+/// The next pass fails, and the one after lists A, B's successor B2 and C: B's subscription is
+/// dropped, A's rides through untouched, no subscribe overlaps a live one, and the rejected C and
+/// the new B2 are booked.
+#[tokio::test]
+async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejection() {
+    let start = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs(),
+    )
+    .expect("seconds fit")
+        - 10;
+    let a = window_market(PLANE_A, "btc", "15m", start, ("1", "2"), Some("77404.14"));
+    let b_open = window_market(PLANE_B, "btc", "5m", start, ("3", "4"), None);
+    let b_stamped = window_market(PLANE_B, "btc", "5m", start, ("3", "4"), Some("2.5"));
+    let b2 = window_market(PLANE_B2, "btc", "5m", start + 300, ("9", "10"), Some("3.5"));
+    let c = window_market(PLANE_C, "btc", "5m", start + 900, ("5", "6"), Some("1.5"));
+    let doge = window_market(PLANE_DOGE, "doge", "5m", start, ("7", "8"), Some("0.1"));
+    // An hourly range market has no window terms, so it does not decode as a market.
+    let hourly = json!({"slug": "cpc-btc-range-hr-test", "assetPriceTerms": {"windowStart": null}});
+    let page = json!({"markets": [hourly.clone(), a.clone(), b_open, c.clone(), doge.clone()]})
+        .to_string();
+    let rolled = json!({"markets": [hourly, a, b2, c, doge]}).to_string();
+    let b_body = json!({"market": b_stamped}).to_string();
+
+    let passes = Arc::new(AtomicUsize::new(0));
+    let (gateway, _) = {
+        let (page, rolled, b_body, passes) = (
+            page.clone(),
+            rolled.clone(),
+            b_body.clone(),
+            Arc::clone(&passes),
+        );
+        serve_http(move |request| match request.path() {
+            "/v1/markets" => match passes.fetch_add(1, Ordering::SeqCst) {
+                0 => Reply::json_str(200, &page),
+                // The second pass fails, so the rejected market waits for the third.
+                1 => Reply::text(500, "gateway down"),
+                _ => Reply::json_str(200, &rolled),
+            },
+            path if path == format!("/v1/market/slug/{PLANE_B}") => Reply::json_str(200, &b_body),
+            _ => Reply::json(404, json!({"message": "unexpected route"})),
+        })
+        .await
+    };
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let api = base_url(listener.local_addr().expect("local address"));
+    let a_frames = vec![
+        book_frame(
+            PLANE_A,
+            &[("0.2800", "40"), ("0.2900", "100")],
+            &[("0.3100", "50"), ("0.3000", "25")],
+            "2026-10-30T15:49:00.787703145Z",
+        ),
+        // The venue resends the whole book about every 100 ms: same prices, one size changed.
+        book_frame(
+            PLANE_A,
+            &[("0.2800", "40"), ("0.2900", "60")],
+            &[("0.3100", "50"), ("0.3000", "25")],
+            PLANE_RESENT,
+        ),
+        book_frame(
+            PLANE_A,
+            &[("0.2900", "100")],
+            &[("0.3200", "7")],
+            "2026-10-30T15:49:05Z",
+        ),
+    ];
+    let book = |slug| book_frame(slug, &[("0.4500", "5")], &[("0.5500", "5")], PLANE_RESENT);
+    let frames = serve_plane_ws(
+        listener,
+        vec![
+            (PLANE_A, a_frames),
+            (PLANE_B, vec![book(PLANE_B)]),
+            (PLANE_B2, vec![book(PLANE_B2)]),
+            (PLANE_C, vec![book(PLANE_C)]),
+        ],
+        PLANE_C,
+    )
+    .await;
+
+    let client = UsClient::authenticated(signer()).with_bases(api, gateway);
+    let store = UsStore::default();
+    let (plane, mut events) =
+        UsPlane::spawn(&client, vec!["btc".to_owned()], store.clone()).expect("spawn");
+    let mut seen = Vec::new();
+    timeout(Duration::from_secs(40), async {
+        let booked = |seen: &[UsPlaneEvent], slug| {
+            seen.iter().any(
+                |event| matches!(event, UsPlaneEvent::Book { data, .. } if data.market_slug == slug),
+            )
+        };
+        while let Some(event) = events.recv().await {
+            seen.push(event);
+            if booked(&seen, PLANE_C) && booked(&seen, PLANE_B2) {
+                return;
+            }
+        }
+        panic!("the plane ended before C and B2 were booked");
+    })
+    .await
+    .expect("C and B2 booked within 40 s");
+
+    // Discovery: both bodies are reported raw, in venue order, and only btc windows are listed.
+    let passes: Vec<&Vec<_>> = seen
+        .iter()
+        .filter_map(|event| match event {
+            UsPlaneEvent::Listed(windows) => Some(windows),
+            _ => None,
+        })
+        .collect();
+    let slugs = |windows: &[_]| -> Vec<String> {
+        windows
+            .iter()
+            .map(|window: &rspm::us::UsWindow| window.slug.clone())
+            .collect()
+    };
+    assert_eq!(
+        slugs(passes[0]),
+        [PLANE_A, PLANE_B, PLANE_C],
+        "decodable btc windows"
+    );
+    assert_eq!(
+        slugs(passes.last().expect("a pass")),
+        [PLANE_A, PLANE_B2, PLANE_C],
+        "the roll"
+    );
+    let first = &passes[0][0];
+    assert_eq!(first.asset, "btc");
+    assert_eq!(first.horizon, UsHorizon::FifteenMin);
+    assert_eq!(first.window_start, start);
+    assert_eq!(first.yes_token, "pmus:yes:1");
+    assert_eq!(first.no_token, "pmus:no:2");
+    assert_eq!(first.min_trade_qty, Some(0.01));
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, UsPlaneEvent::Page { offset: 0, raw } if *raw == page)),
+        "the page body is reported as received, undecodable market included"
+    );
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, UsPlaneEvent::Page { offset: 0, raw } if *raw == rolled)),
+        "the rolled page is reported too"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(event, UsPlaneEvent::DiscoveryFailed(error) if error.contains("gateway down"))),
+        "the failed pass is reported"
+    );
+
+    // Strikes and fees: A's strike came with the listing, B's from its own read, kept raw.
+    assert_eq!(
+        store.strike(PLANE_A).map(f64::to_bits),
+        Some(77404.14_f64.to_bits())
+    );
+    assert_eq!(store.strike(PLANE_B), Some(2.5));
+    assert!(
+        seen.iter().any(|event| matches!(event, UsPlaneEvent::Market { slug, raw } if slug == PLANE_B && *raw == b_body)),
+        "the strike read is reported as received"
+    );
+    assert_eq!(
+        store.fee_schedule("pmus:no:2"),
+        Some((Decimal::new(95, 3), 1)),
+        "the fee coefficient is exact, under both tokens"
+    );
+    assert_eq!(
+        store.fee_schedule("pmus:yes:7"),
+        None,
+        "doge was never listed"
+    );
+
+    // Frames: every frame is reported raw, books with their slug and venue time.
+    assert!(
+        seen.iter().any(|event| matches!(event, UsPlaneEvent::Frame { market_slug: None, venue_ts_ns: None, raw } if raw.contains("heartbeat"))),
+        "a heartbeat is a frame with no market"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(event, UsPlaneEvent::Frame { market_slug: Some(slug), venue_ts_ns: Some(1_793_375_340_787_703_145), .. } if slug == PLANE_A)),
+        "a book frame carries its venue time in ns"
+    );
+
+    // Books: YES from the highest bid and lowest offer, NO its exact complement. The stamp holds
+    // across the resend, which moved a size only, and restamps when a price moves.
+    let mut prior = None;
+    let tops: Vec<_> = seen
+        .iter()
+        .filter_map(|event| match event {
+            UsPlaneEvent::Book {
+                yes_token,
+                no_token,
+                data,
+            } if data.market_slug == PLANE_A => {
+                assert_eq!(
+                    (yes_token.as_str(), no_token.as_str()),
+                    ("pmus:yes:1", "pmus:no:2")
+                );
+                let top = data.top_of_book(prior);
+                prior = Some(UsBookStamp {
+                    bid: top.yes.bid,
+                    ask: top.yes.ask,
+                    stamp_ms: top.last_change_ms,
+                });
+                Some(top)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tops.len(), 3, "A's three frames are booked");
+    assert_eq!(
+        (
+            tops[0].yes.bid,
+            tops[0].yes.ask,
+            tops[0].yes.bid_size,
+            tops[0].yes.ask_size
+        ),
+        (Some(0.29), Some(0.3), Some(100.0), Some(25.0))
+    );
+    assert_eq!(
+        (
+            tops[0].no.bid,
+            tops[0].no.ask,
+            tops[0].no.bid_size,
+            tops[0].no.ask_size
+        ),
+        (Some(0.7), Some(0.71), Some(25.0), Some(100.0)),
+        "NO bid is exactly 1 - 0.3000"
+    );
+    assert_eq!(tops[0].last_change_ms, 1_793_375_340_787);
+    assert_eq!(tops[1].yes.bid_size, Some(60.0));
+    assert_eq!(
+        tops[1].last_change_ms, 1_793_375_340_787,
+        "a size-only resend keeps the stamp"
+    );
+    assert_eq!(tops[2].yes.ask, Some(0.32));
+    assert_eq!(
+        tops[2].last_change_ms, 1_793_375_345_000,
+        "a price move restamps"
+    );
+
+    // Subscriptions: one per window, the 15m group before the 5m one at the same start, a fresh
+    // set for the rejected market, and A is never dropped or resubscribed.
+    let frames = frames.lock().expect("frame log").clone();
+    let subscribes: Vec<(&str, Vec<&str>)> = frames
+        .iter()
+        .filter_map(|frame| frame.get("subscribe"))
+        .map(|subscribe| {
+            let slugs = subscribe["marketSlugs"].as_array().expect("slugs");
+            (
+                subscribe["requestId"].as_str().expect("request id"),
+                slugs.iter().filter_map(Value::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        subscribes,
+        [
+            ("md:set:1:0", vec![PLANE_A]),
+            ("md:set:1:1", vec![PLANE_B]),
+            ("md:set:1:2", vec![PLANE_C]),
+            ("md:set:2:0", vec![PLANE_B2]),
+            ("md:set:2:1", vec![PLANE_C]),
+        ]
+    );
+    let rejected = seen.iter().find_map(|event| match event {
+        UsPlaneEvent::Rejected { request_id, .. } => Some(request_id.as_str()),
+        _ => None,
+    });
+    assert_eq!(
+        rejected,
+        Some("md:set:1:2"),
+        "the venue rejected C's lone subscription"
+    );
+    let unsubscribed: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| frame["unsubscribe"]["requestId"].as_str())
+        .collect();
+    assert_eq!(
+        unsubscribed,
+        ["md:set:1:2", "md:set:1:1"],
+        "the rejected subscription and B's, once unlisted; A's rides through"
+    );
+
+    // Dropping the handle stops the plane and closes the channel.
+    drop(plane);
+    timeout(Duration::from_secs(5), async {
+        while events.recv().await.is_some() {}
+    })
+    .await
+    .expect("the channel closes once the plane is dropped");
 }

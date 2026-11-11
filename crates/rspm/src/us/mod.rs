@@ -7,13 +7,19 @@
 //! Gateway reads (markets, books, settlement) need no credentials. Account,
 //! order and portfolio calls and both WebSockets carry an Ed25519 signature
 //! over `timestamp || METHOD || path`. This module does no automatic retry.
+//!
+//! [`UsPlane`] is the data plane: market discovery, the markets WebSocket subscriptions and the
+//! strike reads, on the venue's window clock.
 
+mod book;
 mod client;
+mod market;
+mod plane;
 mod sign;
 mod types;
 mod ws;
 
-pub use self::{client::*, sign::*, types::*, ws::*};
+pub use self::{book::*, client::*, market::*, plane::*, sign::*, types::*, ws::*};
 
 /// REST base for account, order and portfolio calls.
 pub const US_API_BASE: &str = "https://api.polymarket.us";
@@ -57,4 +63,12 @@ pub fn parse_us_token_id(token_id: &str) -> Option<(UsOutcome, &str)> {
 /// Whether `token_id` names a US market side.
 pub fn is_us_token_id(token_id: &str) -> bool {
     token_id.starts_with(US_TOKEN_PREFIX)
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(i64::MAX)
 }

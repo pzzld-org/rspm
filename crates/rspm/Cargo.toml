@@ -67,6 +67,8 @@ config = { optional = true, workspace = true }
 reqwest = { optional = true, workspace = true }
 # database
 sqlx = { optional = true, workspace = true }
+# time
+chrono = { optional = true, workspace = true }
 # num
 num-traits = { workspace = true }
 # serialization
@@ -179,6 +181,8 @@ us = [
   "json",
   "base64",
   "url",
+  "dep:chrono",
+  "chrono?/alloc",
   "dep:ring",
   "dep:tokio-tungstenite",
   "tokio?/net",

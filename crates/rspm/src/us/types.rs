@@ -91,6 +91,9 @@ pub struct UsOrder {
     pub remaining_quantity: Option<f64>,
     #[serde(rename = "avgPx")]
     pub avg_price: Option<Amount>,
+    /// The commission on all of the order's fills. Absent from older payloads.
+    #[serde(rename = "commissionNotionalTotalCollected")]
+    pub commission_total: Option<Amount>,
 }
 
 /// A single execution (fill, reject, cancel or replace) on an order.

@@ -957,7 +957,7 @@ async fn ws_upgrade_is_signed_subscribe_round_trips_and_events_decode() {
             assert_eq!(execution.id, "exec-1");
             assert_eq!(execution.r#type, "EXECUTION_TYPE_TRADE");
             assert_eq!(execution.order.id, "ord-1");
-            assert_eq!(execution.last_shares, Some(Decimal::new(50, 2)));
+            assert_eq!(execution.fill_quantity, Some(Decimal::new(50, 2)));
             assert!(raw.contains("orderUpdate"));
         }
         other => panic!("expected Execution, got {other:?}"),

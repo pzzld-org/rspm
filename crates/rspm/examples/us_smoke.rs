@@ -122,11 +122,11 @@ async fn main() -> anyhow::Result<()> {
             client.preview_order(&request).await,
             |order| {
                 format!(
-                    "state={} quantity={:?} price={:?} cum_quantity={:?}",
+                    "state={} quantity={:?} price={:?} filled_quantity={:?}",
                     order.state,
                     order.quantity,
                     order.price.as_ref().map(|price| price.value.to_string()),
-                    order.cum_quantity
+                    order.filled_quantity
                 )
             },
         );

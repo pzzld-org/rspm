@@ -85,9 +85,12 @@ pub struct UsOrder {
     pub tif: Option<String>,
     pub price: Option<Amount>,
     pub quantity: Option<f64>,
-    pub cum_quantity: Option<f64>,
-    pub leaves_quantity: Option<f64>,
-    pub avg_px: Option<Amount>,
+    #[serde(rename = "cumQuantity")]
+    pub filled_quantity: Option<f64>,
+    #[serde(rename = "leavesQuantity")]
+    pub remaining_quantity: Option<f64>,
+    #[serde(rename = "avgPx")]
+    pub avg_price: Option<Amount>,
 }
 
 /// A single execution (fill, reject, cancel or replace) on an order.
@@ -97,14 +100,19 @@ pub struct UsExecution {
     pub id: String,
     pub order: UsOrder,
     pub r#type: String,
-    pub last_shares: Option<Decimal>,
-    pub last_px: Option<Amount>,
+    #[serde(rename = "lastShares")]
+    pub fill_quantity: Option<Decimal>,
+    #[serde(rename = "lastPx")]
+    pub fill_price: Option<Amount>,
     pub trade_id: Option<String>,
-    pub aggressor: Option<bool>,
+    #[serde(rename = "aggressor")]
+    pub is_taker: Option<bool>,
     pub order_reject_reason: Option<String>,
     pub text: Option<String>,
-    pub transact_time: Option<String>,
-    pub commission_notional_collected: Option<Amount>,
+    #[serde(rename = "transactTime")]
+    pub executed_at: Option<String>,
+    #[serde(rename = "commissionNotionalCollected")]
+    pub commission: Option<Amount>,
 }
 
 /// One market position from `GET /v1/portfolio/positions`.

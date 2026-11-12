@@ -37,6 +37,8 @@ pub mod fees;
 pub mod gamma;
 #[cfg(feature = "clob")]
 pub mod retry;
+#[cfg(feature = "us")]
+pub mod us;
 #[cfg(feature = "watch")]
 pub mod watch;
 

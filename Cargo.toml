@@ -18,8 +18,8 @@ keywords = []
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/FL03/rspm.git"
-rust-version = "1.96.0"
-version = "0.0.1"
+rust-version = "1.98.0"
+version = "0.0.2"
 
 [workspace.dependencies]
 
@@ -36,6 +36,7 @@ sqlx = { default-features = false, features = ["derive", "macros"], version = "0
 base64 = { version = "0.23" }
 hmac = { version = "0.13" }
 k256 = { version = "0.13" }
+ring = { version = "0.17.14" }
 rust_decimal = { version = "1" }
 sha2 = { version = "0.11" }
 # async
@@ -68,7 +69,7 @@ proc-macro2 = { version = "1" }
 smart-default = { version = "0.7" }
 static_assertions = { version = "1" }
 strum = { default-features = false, features = ["derive"], version = "0.28" }
-syn = { features = ["full", "parsing", "visit"], version = "2" }
+syn = { features = ["full", "parsing", "visit"], version = "3" }
 # serialization
 schemars = { default-features = false, features = ["derive"], version = "1" }
 serde = { default-features = false, features = ["derive"], version = "1" }
@@ -77,11 +78,10 @@ serde_json = { default-features = false, version = "1" }
 serde_path_to_error = { version = "0.1" }
 # polymarket
 polymarket_client_sdk_v2 = { path = "patches/polymarket_client_sdk_v2", version = "0.7" }
-# data-structures
 # WebAssembly
 wasm-bindgen = { default-features = false, version = "0.2" }
 # WebAssembly System Interface
-wit-bindgen = { default-features = false, version = "0.60" }
+wit-bindgen = { default-features = false, version = "0.61" }
 # tracing
 tracing = { default-features = false, features = ["attributes"], version = "0.1" }
 

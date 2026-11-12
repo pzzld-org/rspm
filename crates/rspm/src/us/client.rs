@@ -3,8 +3,9 @@
     Contrib: @FL03
 */
 use super::{
-    CreateOrderRequest, CreateOrderResponse, US_API_BASE, US_GATEWAY_BASE, UsBalance, UsMarket,
-    UsMarketData, UsMarketsQuery, UsOrder, UsPositionsPage, UsSigner,
+    CreateOrderRequest, CreateOrderResponse, US_API_BASE, US_GATEWAY_BASE, UsActivitiesPage,
+    UsActivitiesQuery, UsBalance, UsMarket, UsMarketData, UsMarketsQuery, UsOrder, UsPositionsPage,
+    UsSigner,
 };
 use crate::{Error, Result};
 use core::time::Duration;
@@ -150,6 +151,29 @@ impl UsClient {
             query.push(("cursor", cursor.to_owned()));
         }
         let url = endpoint(&self.api_base, &["v1", "portfolio", "positions"], &query)?;
+        self.get(url, true).await
+    }
+
+    /// `GET /v1/portfolio/activities`. The filters go in the query, which is not signed.
+    pub async fn activities(&self, q: &UsActivitiesQuery) -> Result<UsActivitiesPage> {
+        let mut query: Vec<(&str, String)> = q
+            .types
+            .iter()
+            .map(|kind| ("types", kind.as_str().to_owned()))
+            .collect();
+        if let Some(slug) = &q.market_slug {
+            query.push(("marketSlug", slug.clone()));
+        }
+        if let Some(limit) = q.limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = &q.cursor {
+            query.push(("cursor", cursor.clone()));
+        }
+        if let Some(order) = q.sort_order {
+            query.push(("sortOrder", order.as_str().to_owned()));
+        }
+        let url = endpoint(&self.api_base, &["v1", "portfolio", "activities"], &query)?;
         self.get(url, true).await
     }
 

@@ -138,6 +138,92 @@ pub struct UsPositionsPage {
     pub eof: Option<bool>,
 }
 
+/// Filters for `GET /v1/portfolio/activities`. Every one is optional.
+#[derive(Clone, Debug, Default)]
+pub struct UsActivitiesQuery {
+    pub types: Vec<UsActivityType>,
+    pub market_slug: Option<String>,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    pub sort_order: Option<UsSortOrder>,
+}
+
+/// An activity type filter, as its wire value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsActivityType {
+    Trade,
+}
+
+impl UsActivityType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trade => "ACTIVITY_TYPE_TRADE",
+        }
+    }
+}
+
+/// Activity order by timestamp. The venue's default is newest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsSortOrder {
+    Descending,
+    Ascending,
+}
+
+impl UsSortOrder {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Descending => "SORT_ORDER_DESCENDING",
+            Self::Ascending => "SORT_ORDER_ASCENDING",
+        }
+    }
+}
+
+/// A page of activities.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsActivitiesPage {
+    #[serde(default)]
+    pub activities: Vec<UsActivity>,
+    pub next_cursor: Option<String>,
+    pub eof: Option<bool>,
+}
+
+/// One activity. Only a trade activity's body is parsed.
+#[derive(Clone, Debug, Deserialize)]
+pub struct UsActivity {
+    pub trade: Option<UsTradeActivity>,
+}
+
+/// A trade activity. It names no order, intent or fee.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsTradeActivity {
+    /// The exchange-assigned trade id.
+    pub id: String,
+    pub market_slug: Option<String>,
+    pub state: Option<UsTradeState>,
+    #[serde(rename = "createTime")]
+    pub created_at: Option<String>,
+    pub price: Option<Amount>,
+    #[serde(rename = "qtyDecimal")]
+    pub quantity: Option<Decimal>,
+    #[serde(rename = "isAggressor")]
+    pub is_taker: Option<bool>,
+}
+
+/// A trade's state. Every state but these three is `Other`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub enum UsTradeState {
+    #[serde(rename = "TRADE_STATE_CLEARED")]
+    Cleared,
+    #[serde(rename = "TRADE_STATE_BUSTED")]
+    Busted,
+    #[serde(rename = "TRADE_STATE_REJECTED")]
+    Rejected,
+    #[serde(other)]
+    Other,
+}
+
 /// One currency balance. Money fields are JSON numbers.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

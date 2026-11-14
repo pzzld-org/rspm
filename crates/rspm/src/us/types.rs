@@ -232,9 +232,11 @@ impl UsTradeActivity {
     }
 }
 
-/// A trade's state. Every state but these three is `Other`.
+/// A trade's state. Unrecognized states are `Other`.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 pub enum UsTradeState {
+    #[serde(rename = "TRADE_STATE_NEW")]
+    New,
     #[serde(rename = "TRADE_STATE_CLEARED")]
     Cleared,
     #[serde(rename = "TRADE_STATE_BUSTED")]

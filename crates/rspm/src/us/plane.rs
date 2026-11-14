@@ -27,6 +27,8 @@ use tokio::{
 
 /// Subscription type for book and stats updates on the markets WebSocket.
 const MARKET_DATA: &str = "SUBSCRIPTION_TYPE_MARKET_DATA";
+const TRADES: &str = "SUBSCRIPTION_TYPE_TRADE";
+const SUBSCRIPTION_TYPES: [(&str, &str); 2] = [("md", MARKET_DATA), ("trade", TRADES)];
 /// Windows whose markets list every window within 50 min of now.
 const LOOKAHEAD_SECS: i64 = 50 * 60;
 const DISCOVERY_LIMIT: u32 = 200;
@@ -159,7 +161,7 @@ struct MarketEnvelope {
 struct State {
     listed: HashMap<String, UsWindow>,
     // Live subscriptions on the markets WebSocket: request id and the market slugs it covers.
-    subscriptions: Vec<(String, BTreeSet<String>)>,
+    subscriptions: Vec<(&'static str, String, BTreeSet<String>)>,
     // Sequence that keeps a new subscription's ids apart from earlier ones.
     subscription_seq: u64,
     strike_watch: BTreeSet<String>,
@@ -193,7 +195,8 @@ impl Plane {
                     next = Instant::now() + Duration::from_millis(delay);
                     // A failed pass after a rejection leaves listed markets unsubscribed: retry soon.
                     if state.listed.keys().any(|slug| {
-                        !state.subscriptions.iter().any(|(_, slugs)| slugs.contains(slug))
+                        SUBSCRIPTION_TYPES.iter().any(|(_, kind)| !state.subscriptions
+                            .iter().any(|(sub_kind, _, slugs)| sub_kind == kind && slugs.contains(slug)))
                     }) {
                         next = next.min(Instant::now() + RESUBSCRIBE_AFTER);
                     }
@@ -205,7 +208,7 @@ impl Plane {
                         // socket does not replay it) and let discovery resubscribe them soon.
                         if let Some(request_id) = rejected
                             && let Some(index) =
-                                state.subscriptions.iter().position(|(id, _)| *id == request_id)
+                                state.subscriptions.iter().position(|(_, id, _)| *id == request_id)
                         {
                             state.subscriptions.remove(index);
                             ws.unsubscribe(&request_id);
@@ -266,6 +269,21 @@ impl Plane {
                     })
                     .await;
                 }
+            }
+            UsWsEvent::Trade {
+                market_slug,
+                trade_time,
+                raw,
+            } => {
+                self.emit(UsPlaneEvent::Frame {
+                    market_slug: Some(market_slug),
+                    venue_ts_ns: trade_time
+                        .as_deref()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .and_then(|time| time.timestamp_nanos_opt()),
+                    raw,
+                })
+                .await;
             }
             UsWsEvent::OrderSnapshot { raw, .. }
             | UsWsEvent::Execution { raw, .. }
@@ -354,38 +372,41 @@ impl Plane {
         // live subscription covers are subscribed. A listed market never leaves its subscription, so
         // its book stays continuous across window rolls, and since unsubscribes go out first, only
         // listed markets are subscribed, whether the cap counts subscriptions or markets.
-        state.subscriptions.retain(|(request_id, slugs)| {
+        state.subscriptions.retain(|(_, request_id, slugs)| {
             let live = slugs.iter().any(|slug| listed.contains_key(slug));
             if !live {
                 ws.unsubscribe(request_id);
             }
             live
         });
-        let covered: BTreeSet<&String> = state
-            .subscriptions
-            .iter()
-            .flat_map(|(_, slugs)| slugs)
-            .collect();
-        let mut uncovered: BTreeMap<(i64, &str), BTreeSet<String>> = BTreeMap::new();
-        for (slug, entry) in &listed {
-            if !covered.contains(slug) {
-                uncovered
-                    .entry((entry.window_start, entry.horizon.as_str()))
-                    .or_default()
-                    .insert(slug.clone());
+        state.subscription_seq += 1;
+        for (prefix, subscription_type) in SUBSCRIPTION_TYPES {
+            let covered: BTreeSet<&String> = state
+                .subscriptions
+                .iter()
+                .filter(|(kind, _, _)| *kind == subscription_type)
+                .flat_map(|(_, _, slugs)| slugs)
+                .collect();
+            let mut uncovered: BTreeMap<(i64, &str), BTreeSet<String>> = BTreeMap::new();
+            for (slug, entry) in &listed {
+                if !covered.contains(slug) {
+                    uncovered
+                        .entry((entry.window_start, entry.horizon.as_str()))
+                        .or_default()
+                        .insert(slug.clone());
+                }
             }
-        }
-        if !uncovered.is_empty() {
-            state.subscription_seq += 1;
-        }
-        for (group, market_slugs) in uncovered.into_values().enumerate() {
-            let request_id = subscription_id(state.subscription_seq, group);
-            ws.subscribe(UsSubscription {
-                request_id: request_id.clone(),
-                subscription_type: MARKET_DATA,
-                market_slugs: market_slugs.iter().cloned().collect(),
-            });
-            state.subscriptions.push((request_id, market_slugs));
+            for (group, market_slugs) in uncovered.into_values().enumerate() {
+                let request_id = format!("{prefix}:set:{}:{group}", state.subscription_seq);
+                ws.subscribe(UsSubscription {
+                    request_id: request_id.clone(),
+                    subscription_type,
+                    market_slugs: market_slugs.iter().cloned().collect(),
+                });
+                state
+                    .subscriptions
+                    .push((subscription_type, request_id, market_slugs));
+            }
         }
 
         state.strike_watch.retain(|slug| listed.contains_key(slug));
@@ -453,11 +474,6 @@ impl Plane {
             .map(|envelope| envelope.market)
             .map_err(|error| error.to_string())
     }
-}
-
-/// Request id of one chunk of subscription set `seq`.
-fn subscription_id(seq: u64, chunk: usize) -> String {
-    format!("md:set:{seq}:{chunk}")
 }
 
 /// `secs` as the venue's RFC 3339 UTC query value.

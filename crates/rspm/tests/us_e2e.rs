@@ -1243,7 +1243,8 @@ async fn serve_plane_ws(
                 .iter()
                 .filter_map(Value::as_str)
                 .collect();
-            if !rejected && slugs == [reject_once] {
+            let trade = subscribe["subscriptionType"] == "SUBSCRIPTION_TYPE_TRADE";
+            if !rejected && !trade && slugs == [reject_once] {
                 rejected = true;
                 let rejection = json!({
                     "requestId": subscribe["requestId"],
@@ -1258,7 +1259,18 @@ async fn serve_plane_ws(
             let mut replies = vec![json!({"heartbeat": {}}).to_string()];
             for (slug, frames) in &books {
                 if slugs.contains(slug) {
-                    replies.extend(frames.iter().cloned());
+                    if trade {
+                        replies.push(
+                            json!({"trade": {
+                                "marketSlug": slug,
+                                "tradeTime": "2026-10-30T15:49:09Z",
+                                "price": {"value": "0.31", "currency": "USD"},
+                            }})
+                            .to_string(),
+                        );
+                    } else {
+                        replies.extend(frames.iter().cloned());
+                    }
                 }
             }
             for reply in replies {
@@ -1371,7 +1383,10 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
         };
         while let Some(event) = events.recv().await {
             seen.push(event);
-            if booked(&seen, PLANE_C) && booked(&seen, PLANE_B2) {
+            let rolled_trade = seen.iter().any(|event| matches!(event,
+                UsPlaneEvent::Frame { market_slug: Some(slug), venue_ts_ns: Some(1_793_375_349_000_000_000), raw }
+                if slug == PLANE_B2 && raw.contains("\"trade\"")));
+            if booked(&seen, PLANE_C) && booked(&seen, PLANE_B2) && rolled_trade {
                 return;
             }
         }
@@ -1521,6 +1536,7 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
     let subscribes: Vec<(&str, Vec<&str>)> = frames
         .iter()
         .filter_map(|frame| frame.get("subscribe"))
+        .filter(|sub| sub["subscriptionType"] == "SUBSCRIPTION_TYPE_MARKET_DATA")
         .map(|subscribe| {
             let slugs = subscribe["marketSlugs"].as_array().expect("slugs");
             (
@@ -1530,13 +1546,16 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
         })
         .collect();
     assert_eq!(
-        subscribes,
+        subscribes
+            .iter()
+            .map(|(_, slugs)| slugs.clone())
+            .collect::<Vec<_>>(),
         [
-            ("md:set:1:0", vec![PLANE_A]),
-            ("md:set:1:1", vec![PLANE_B]),
-            ("md:set:1:2", vec![PLANE_C]),
-            ("md:set:2:0", vec![PLANE_B2]),
-            ("md:set:2:1", vec![PLANE_C]),
+            vec![PLANE_A],
+            vec![PLANE_B],
+            vec![PLANE_C],
+            vec![PLANE_B2],
+            vec![PLANE_C],
         ]
     );
     let rejected = seen.iter().find_map(|event| match event {
@@ -1545,18 +1564,31 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
     });
     assert_eq!(
         rejected,
-        Some("md:set:1:2"),
+        Some(subscribes[2].0),
         "the venue rejected C's lone subscription"
     );
     let unsubscribed: Vec<&str> = frames
         .iter()
         .filter_map(|frame| frame["unsubscribe"]["requestId"].as_str())
         .collect();
-    assert_eq!(
-        unsubscribed,
-        ["md:set:1:2", "md:set:1:1"],
-        "the rejected subscription and B's, once unlisted; A's rides through"
-    );
+    assert!(unsubscribed.contains(&subscribes[2].0));
+    assert!(unsubscribed.contains(&subscribes[1].0));
+    let trade_request = |slug| {
+        frames
+            .iter()
+            .filter_map(|frame| frame.get("subscribe"))
+            .find(|sub| {
+                sub["subscriptionType"] == "SUBSCRIPTION_TYPE_TRADE"
+                    && sub["marketSlugs"]
+                        .as_array()
+                        .is_some_and(|slugs| slugs.iter().any(|item| item == slug))
+            })
+            .and_then(|sub| sub["requestId"].as_str())
+            .expect("trade subscription")
+    };
+    assert!(unsubscribed.contains(&trade_request(PLANE_B)));
+    assert!(!unsubscribed.contains(&trade_request(PLANE_A)));
+    assert!(!unsubscribed.contains(&subscribes[0].0));
 
     // Dropping the handle stops the plane and closes the channel.
     drop(plane);

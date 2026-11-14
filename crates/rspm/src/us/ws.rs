@@ -88,6 +88,11 @@ pub enum UsWsEvent {
         data: UsMarketData,
         raw: String,
     },
+    Trade {
+        market_slug: String,
+        trade_time: Option<String>,
+        raw: String,
+    },
     SubscriptionError {
         request_id: String,
         error: String,
@@ -421,6 +426,19 @@ fn decode(raw: String) -> UsWsEvent {
         return match UsMarketData::deserialize(body) {
             Ok(data) => UsWsEvent::MarketData { data, raw },
             Err(_) => UsWsEvent::Other { raw },
+        };
+    }
+    if let Some(body) = first(&frame, &["trade"])
+        && let Some(market_slug) = body.get("marketSlug").and_then(Value::as_str)
+        && !market_slug.is_empty()
+    {
+        return UsWsEvent::Trade {
+            market_slug: market_slug.to_owned(),
+            trade_time: body
+                .get("tradeTime")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            raw,
         };
     }
     UsWsEvent::Other { raw }

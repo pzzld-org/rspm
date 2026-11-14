@@ -468,6 +468,19 @@ async fn rest_requests_are_signed_over_path_and_match_the_wire_shape() {
             ("POST", "/v1/orders") => {
                 Reply::json(200, json!({"id": "ord-1", "executions": []}))
             }
+            ("GET", "/v1/portfolio/activities") => Reply::json(
+                200,
+                json!({
+                    "activities": [{"trade": {
+                        "id": "trade-1", "isAggressor": false, "state": "TRADE_STATE_NEW",
+                        "aggressorExecution": {"id": "e-taker", "order": {"id": "ord-other"}, "tradeId": "trade-1", "type": "EXECUTION_TYPE_FILL", "aggressor": true},
+                        "passiveExecution": {"id": "e-maker", "order": {"id": "ord-own"}, "tradeId": "trade-1", "type": "EXECUTION_TYPE_FILL", "aggressor": false,
+                            "lastShares": "1.5", "lastPx": {"value": "0.42", "currency": "USD"},
+                            "commissionNotionalCollected": {"value": "0", "currency": "USD"}}
+                    }}, {"trade": {"id": "legacy", "isAggressor": true}}],
+                    "eof": true
+                }),
+            ),
             ("POST", "/v1/order/preview") => Reply::json(
                 200,
                 // Preview has no exchange id yet, which the client must tolerate.
@@ -487,6 +500,33 @@ async fn rest_requests_are_signed_over_path_and_match_the_wire_shape() {
     let position = &page.positions[MARKET_SLUG];
     assert_eq!(position.net_position_decimal, Decimal::new(15, 1));
     assert_eq!(page.next_cursor.as_deref(), Some("c2"));
+
+    let activities = client
+        .activities(&Default::default())
+        .await
+        .expect("activities");
+    let trade = activities.activities[0]
+        .trade
+        .as_ref()
+        .expect("trade activity");
+    let execution = trade
+        .account_execution()
+        .expect("the passive account execution");
+    assert_eq!(execution.order.id, "ord-own");
+    assert_eq!(execution.id, "e-maker");
+    assert_eq!(execution.fill_quantity, Some(Decimal::new(15, 1)));
+    assert_eq!(
+        execution.commission.as_ref().map(|fee| fee.value),
+        Some(Decimal::ZERO)
+    );
+    assert!(
+        activities.activities[1]
+            .trade
+            .as_ref()
+            .expect("legacy trade")
+            .account_execution()
+            .is_none()
+    );
 
     // The S-4.1 example order, with the frozen AUTOMATIC indicator.
     let example = create_request(
@@ -555,7 +595,7 @@ async fn rest_requests_are_signed_over_path_and_match_the_wire_shape() {
     // query is not signed, and the body is not signed.
     let public_key = signer().public_key();
     let sent = requests(&log);
-    assert_eq!(sent.len(), 5);
+    assert_eq!(sent.len(), 6);
     for request in &sent {
         assert_eq!(request.header("x-pm-access-key"), Some(KEY_ID));
         assert_eq!(request.header("content-type"), Some("application/json"));

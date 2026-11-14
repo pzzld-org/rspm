@@ -194,7 +194,7 @@ pub struct UsActivity {
     pub trade: Option<UsTradeActivity>,
 }
 
-/// A trade activity. It names no order, intent or fee.
+/// A trade activity, optionally carrying both sides' execution reports.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsTradeActivity {
@@ -209,6 +209,27 @@ pub struct UsTradeActivity {
     pub quantity: Option<Decimal>,
     #[serde(rename = "isAggressor")]
     pub is_taker: Option<bool>,
+    aggressor_execution: Option<UsExecution>,
+    passive_execution: Option<UsExecution>,
+}
+
+impl UsTradeActivity {
+    /// The authenticated account's execution, where the account side and trade identity agree.
+    /// Older payloads may supply no execution; never take the counterparty leg as a fallback.
+    pub fn account_execution(&self) -> Option<&UsExecution> {
+        let taker = self.is_taker?;
+        let execution = if taker {
+            self.aggressor_execution.as_ref()
+        } else {
+            self.passive_execution.as_ref()
+        }?;
+        (execution.is_taker == Some(taker)
+            && !self.id.trim().is_empty()
+            && execution.trade_id.as_deref() == Some(self.id.as_str())
+            && !execution.id.trim().is_empty()
+            && !execution.order.id.trim().is_empty())
+        .then_some(execution)
+    }
 }
 
 /// A trade's state. Every state but these three is `Other`.

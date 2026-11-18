@@ -181,6 +181,7 @@ fn event_kind(event: &UsWsEvent) -> &'static str {
         UsWsEvent::Execution { .. } => "Execution",
         UsWsEvent::Position { .. } => "Position",
         UsWsEvent::MarketData { .. } => "MarketData",
+        UsWsEvent::Trade { .. } => "Trade",
         UsWsEvent::SubscriptionError { .. } => "SubscriptionError",
         UsWsEvent::Other { .. } => "Other",
     }

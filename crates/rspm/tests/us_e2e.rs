@@ -9,7 +9,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -1153,6 +1153,7 @@ const PLANE_B: &str = "cpc-btc-updown-5m-test-b";
 const PLANE_B2: &str = "cpc-btc-updown-5m-test-b2";
 const PLANE_C: &str = "cpc-btc-updown-5m-test-c";
 const PLANE_DOGE: &str = "cpc-doge-updown-5m-test-d";
+const PLANE_E: &str = "cpc-btc-updown-5m-test-e";
 const PLANE_RESENT: &str = "2026-10-30T15:49:00.887703145Z";
 
 fn rfc3339(secs: i64) -> String {
@@ -1217,65 +1218,93 @@ fn book_frame(
     .to_string()
 }
 
-/// A markets WebSocket that answers a subscribe with a heartbeat and the `books` of each market it
-/// names, except that it rejects the first subscription naming exactly `reject_once`. Every client
-/// frame is logged.
+/// A markets WebSocket endpoint that accepts any number of connections. Each connection holds at
+/// most `cap` subscriptions, an unsubscribe frees its slot, and the next subscribe past the cap is
+/// refused the way the venue refuses it. An accepted subscribe is answered with a heartbeat and
+/// the `books` of each market it names, or one trade per market for a trade subscription. The
+/// first book subscription naming exactly `reject_once` is rejected. Every client frame is logged.
 async fn serve_plane_ws(
     listener: TcpListener,
     books: Vec<(&'static str, Vec<String>)>,
     reject_once: &'static str,
+    cap: usize,
 ) -> Arc<Mutex<Vec<Value>>> {
     let public_key = signer().public_key();
     let log: Arc<Mutex<Vec<Value>>> = Arc::default();
     let sink = Arc::clone(&log);
+    let books = Arc::new(books);
+    let rejected = Arc::new(AtomicBool::new(false));
     tokio::spawn(async move {
-        let (mut socket, _) = accept_signed(&listener, public_key).await;
-        let mut rejected = false;
-        while let Some(Ok(Message::Text(text))) = socket.next().await {
-            let frame: Value = serde_json::from_str(text.as_str()).expect("client frame");
-            sink.lock().expect("frame log").push(frame.clone());
-            let Some(subscribe) = frame.get("subscribe") else {
-                continue;
-            };
-            let slugs: Vec<&str> = subscribe["marketSlugs"]
-                .as_array()
-                .expect("market slugs")
-                .iter()
-                .filter_map(Value::as_str)
-                .collect();
-            let trade = subscribe["subscriptionType"] == "SUBSCRIPTION_TYPE_TRADE";
-            if !rejected && !trade && slugs == [reject_once] {
-                rejected = true;
-                let rejection = json!({
-                    "requestId": subscribe["requestId"],
-                    "error": "subscription temporarily unavailable",
-                });
-                socket
-                    .send(Message::text(rejection.to_string()))
-                    .await
-                    .expect("rejection");
-                continue;
-            }
-            let mut replies = vec![json!({"heartbeat": {}}).to_string()];
-            for (slug, frames) in &books {
-                if slugs.contains(slug) {
-                    if trade {
-                        replies.push(
-                            json!({"trade": {
-                                "marketSlug": slug,
-                                "tradeTime": "2026-10-30T15:49:09Z",
-                                "price": {"value": "0.31", "currency": "USD"},
-                            }})
-                            .to_string(),
-                        );
+        loop {
+            let (mut socket, _) = accept_signed(&listener, public_key).await;
+            let (sink, books, rejected) =
+                (Arc::clone(&sink), Arc::clone(&books), Arc::clone(&rejected));
+            tokio::spawn(async move {
+                let mut held: Vec<String> = Vec::new();
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let frame: Value = serde_json::from_str(text.as_str()).expect("client frame");
+                    sink.lock().expect("frame log").push(frame.clone());
+                    if let Some(request_id) = frame["unsubscribe"]["requestId"].as_str() {
+                        held.retain(|id| id != request_id);
+                        continue;
+                    }
+                    let Some(subscribe) = frame.get("subscribe") else {
+                        continue;
+                    };
+                    let slugs: Vec<&str> = subscribe["marketSlugs"]
+                        .as_array()
+                        .expect("market slugs")
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    let trade = subscribe["subscriptionType"] == "SUBSCRIPTION_TYPE_TRADE";
+                    let refusal = if !trade
+                        && slugs == [reject_once]
+                        && !rejected.swap(true, Ordering::SeqCst)
+                    {
+                        Some("subscription temporarily unavailable")
+                    } else if held.len() >= cap {
+                        Some("max subscriptions per connection reached")
                     } else {
-                        replies.extend(frames.iter().cloned());
+                        None
+                    };
+                    if let Some(error) = refusal {
+                        let rejection =
+                            json!({"requestId": subscribe["requestId"], "error": error});
+                        socket
+                            .send(Message::text(rejection.to_string()))
+                            .await
+                            .expect("rejection");
+                        continue;
+                    }
+                    held.push(
+                        subscribe["requestId"]
+                            .as_str()
+                            .expect("request id")
+                            .to_owned(),
+                    );
+                    let mut replies = vec![json!({"heartbeat": {}}).to_string()];
+                    for (slug, frames) in books.iter() {
+                        if slugs.contains(slug) {
+                            if trade {
+                                replies.push(
+                                    json!({"trade": {
+                                        "marketSlug": slug,
+                                        "tradeTime": "2026-10-30T15:49:09Z",
+                                        "price": {"value": "0.31", "currency": "USD"},
+                                    }})
+                                    .to_string(),
+                                );
+                            } else {
+                                replies.extend(frames.iter().cloned());
+                            }
+                        }
+                    }
+                    for reply in replies {
+                        socket.send(Message::text(reply)).await.expect("book frame");
                     }
                 }
-            }
-            for reply in replies {
-                socket.send(Message::text(reply)).await.expect("book frame");
-            }
+            });
         }
     });
     log
@@ -1289,6 +1318,12 @@ async fn serve_plane_ws(
 /// The next pass fails, and the one after lists A, B's successor B2 and C: B's subscription is
 /// dropped, A's rides through untouched, no subscribe overlaps a live one, and the rejected C and
 /// the new B2 are booked.
+///
+/// The venue also still lists E, a 5m window that ended and has not settled, and each connection
+/// holds 3 subscriptions. Books and trades ride separate connections, so trades never take a
+/// book's slot. On the roll the books connection is full (E, A, B2) when C is subscribed again:
+/// the venue refuses it, E gives up its slot, and C is booked. E's trade subscription gives way to
+/// C's the same way.
 #[tokio::test]
 async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejection() {
     let start = i64::try_from(
@@ -1307,9 +1342,11 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
     let doge = window_market(PLANE_DOGE, "doge", "5m", start, ("7", "8"), Some("0.1"));
     // An hourly range market has no window terms, so it does not decode as a market.
     let hourly = json!({"slug": "cpc-btc-range-hr-test", "assetPriceTerms": {"windowStart": null}});
-    let page = json!({"markets": [hourly.clone(), a.clone(), b_open, c.clone(), doge.clone()]})
-        .to_string();
-    let rolled = json!({"markets": [hourly, a, b2, c, doge]}).to_string();
+    let e = window_market(PLANE_E, "btc", "5m", start - 600, ("11", "12"), Some("9.5"));
+    let page =
+        json!({"markets": [hourly.clone(), a.clone(), b_open, c.clone(), doge.clone(), e.clone()]})
+            .to_string();
+    let rolled = json!({"markets": [hourly, a, b2, c, doge, e]}).to_string();
     let b_body = json!({"market": b_stamped}).to_string();
 
     let passes = Arc::new(AtomicUsize::new(0));
@@ -1367,6 +1404,7 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
             (PLANE_C, vec![book(PLANE_C)]),
         ],
         PLANE_C,
+        3,
     )
     .await;
 
@@ -1411,12 +1449,12 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
     };
     assert_eq!(
         slugs(passes[0]),
-        [PLANE_A, PLANE_B, PLANE_C],
+        [PLANE_A, PLANE_B, PLANE_C, PLANE_E],
         "decodable btc windows"
     );
     assert_eq!(
         slugs(passes.last().expect("a pass")),
-        [PLANE_A, PLANE_B2, PLANE_C],
+        [PLANE_A, PLANE_B2, PLANE_C, PLANE_E],
         "the roll"
     );
     let first = &passes[0][0];
@@ -1530,8 +1568,8 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
         "a price move restamps"
     );
 
-    // Subscriptions: one per window, the 15m group before the 5m one at the same start, a fresh
-    // set for the rejected market, and A is never dropped or resubscribed.
+    // Subscriptions: one per window, oldest window first, the 15m group before the 5m one at the
+    // same start, a fresh set for the rejected market, and A is never dropped or resubscribed.
     let frames = frames.lock().expect("frame log").clone();
     let subscribes: Vec<(&str, Vec<&str>)> = frames
         .iter()
@@ -1551,28 +1589,44 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
             .map(|(_, slugs)| slugs.clone())
             .collect::<Vec<_>>(),
         [
+            vec![PLANE_E],
             vec![PLANE_A],
             vec![PLANE_B],
             vec![PLANE_C],
             vec![PLANE_B2],
             vec![PLANE_C],
+            vec![PLANE_C],
         ]
     );
-    let rejected = seen.iter().find_map(|event| match event {
-        UsPlaneEvent::Rejected { request_id, .. } => Some(request_id.as_str()),
-        _ => None,
-    });
+    let book_rejections: Vec<(&str, &str)> = seen
+        .iter()
+        .filter_map(|event| match event {
+            UsPlaneEvent::Rejected { request_id, error } if request_id.starts_with("md:") => {
+                Some((request_id.as_str(), error.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        rejected,
-        Some(subscribes[2].0),
-        "the venue rejected C's lone subscription"
+        book_rejections,
+        [
+            (subscribes[3].0, "subscription temporarily unavailable"),
+            (subscribes[5].0, "max subscriptions per connection reached"),
+        ],
+        "the venue rejected C's lone subscription, then refused C on the full connection"
     );
     let unsubscribed: Vec<&str> = frames
         .iter()
         .filter_map(|frame| frame["unsubscribe"]["requestId"].as_str())
         .collect();
+    assert!(unsubscribed.contains(&subscribes[3].0));
     assert!(unsubscribed.contains(&subscribes[2].0));
-    assert!(unsubscribed.contains(&subscribes[1].0));
+    assert!(
+        unsubscribed.contains(&subscribes[0].0),
+        "the ended window E gave its book slot to C"
+    );
+    assert!(!unsubscribed.contains(&subscribes[4].0));
+    assert!(!unsubscribed.contains(&subscribes[6].0));
     let trade_request = |slug| {
         frames
             .iter()
@@ -1588,7 +1642,11 @@ async fn data_plane_discovers_subscribes_books_and_resubscribes_after_a_rejectio
     };
     assert!(unsubscribed.contains(&trade_request(PLANE_B)));
     assert!(!unsubscribed.contains(&trade_request(PLANE_A)));
-    assert!(!unsubscribed.contains(&subscribes[0].0));
+    assert!(
+        unsubscribed.contains(&trade_request(PLANE_E)),
+        "E's trade subscription gave way to C's"
+    );
+    assert!(!unsubscribed.contains(&subscribes[1].0));
 
     // Dropping the handle stops the plane and closes the channel.
     drop(plane);

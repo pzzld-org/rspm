@@ -4,9 +4,9 @@
 */
 //! The Polymarket US data plane.
 //!
-//! One task discovers the Up/Down window markets on the window clock, keeps the markets
-//! WebSocket subscribed to the listed ones, and reads each window's `priceToBeat` into a
-//! [`UsStore`]. It reports what it saw as [`UsPlaneEvent`]s: every venue body and frame exactly
+//! One task discovers the Up/Down window markets on the window clock, keeps two markets
+//! WebSockets subscribed to the listed ones (books on one, public trades on the other), and
+//! reads each window's `priceToBeat` into a [`UsStore`]. It reports what it saw as [`UsPlaneEvent`]s: every venue body and frame exactly
 //! as received, so a caller can capture them raw, and the typed results.
 use super::{
     UsClient, UsMarket, UsMarketData, UsStore, UsSubscription, UsWindow, UsWs, UsWsChannel,
@@ -29,6 +29,8 @@ use tokio::{
 const MARKET_DATA: &str = "SUBSCRIPTION_TYPE_MARKET_DATA";
 const TRADES: &str = "SUBSCRIPTION_TYPE_TRADE";
 const SUBSCRIPTION_TYPES: [(&str, &str); 2] = [("md", MARKET_DATA), ("trade", TRADES)];
+/// The venue's rejection of a subscription on a connection that already holds its limit.
+const CAP_REJECTION: &str = "max subscriptions";
 /// Windows whose markets list every window within 50 min of now.
 const LOOKAHEAD_SECS: i64 = 50 * 60;
 const DISCOVERY_LIMIT: u32 = 200;
@@ -122,7 +124,7 @@ impl Drop for UsPlane {
 impl UsPlane {
     /// Spawn the plane and return it with its event receiver. `assets` are the venue tickers to
     /// discover, matched exactly; `store` receives the strikes and fees it reads. The event channel
-    /// closes when the markets WebSocket task ends, and the plane stops when the receiver is dropped.
+    /// closes when the books WebSocket task ends, and the plane stops when the receiver is dropped.
     /// A consumer that stops reading stalls the plane.
     ///
     /// Returns `InvalidParam` when the client has no signer. Must be called inside a Tokio runtime.
@@ -131,7 +133,8 @@ impl UsPlane {
         assets: Vec<String>,
         store: UsStore,
     ) -> Result<(Self, mpsc::Receiver<UsPlaneEvent>)> {
-        let (ws, ws_events) = UsWs::spawn(client, UsWsChannel::Markets, WS_IDLE)?;
+        let (books, book_events) = UsWs::spawn(client, UsWsChannel::Markets, WS_IDLE)?;
+        let (trades, trade_events) = UsWs::spawn(client, UsWsChannel::Markets, WS_IDLE)?;
         let (events, receiver) = mpsc::channel(EVENT_CAPACITY);
         let plane = Plane {
             client: client.clone(),
@@ -139,7 +142,7 @@ impl UsPlane {
             store,
             events,
         };
-        let task = tokio::spawn(plane.run(ws, ws_events));
+        let task = tokio::spawn(plane.run(Sockets { books, trades }, book_events, trade_events));
         Ok((Self { task }, receiver))
     }
 }
@@ -157,11 +160,40 @@ struct MarketEnvelope {
     market: UsMarket,
 }
 
+/// The markets WebSockets. The venue caps subscriptions per connection (about 10), so books and
+/// trades each get their own: a trade subscription never takes the slot a book needs.
+struct Sockets {
+    books: UsWs,
+    trades: UsWs,
+}
+
+impl Sockets {
+    fn of(&self, subscription_type: &str) -> &UsWs {
+        if subscription_type == TRADES {
+            &self.trades
+        } else {
+            &self.books
+        }
+    }
+}
+
+/// The start and end, unix seconds, of the window a subscription's markets belong to.
+fn span(listed: &HashMap<String, UsWindow>, slugs: &BTreeSet<String>) -> Option<(i64, i64)> {
+    let window = slugs.iter().find_map(|slug| listed.get(slug))?;
+    Some((
+        window.window_start,
+        window.window_start + window.horizon.secs(),
+    ))
+}
+
 #[derive(Default)]
 struct State {
     listed: HashMap<String, UsWindow>,
-    // Live subscriptions on the markets WebSocket: request id and the market slugs it covers.
+    // Live subscriptions: type, request id and the market slugs it covers.
     subscriptions: Vec<(&'static str, String, BTreeSet<String>)>,
+    // Listed markets of ended windows that gave up their subscription on a full connection, by
+    // type. They are not resubscribed.
+    shed: BTreeSet<(&'static str, String)>,
     // Sequence that keeps a new subscription's ids apart from earlier ones.
     subscription_seq: u64,
     strike_watch: BTreeSet<String>,
@@ -181,9 +213,15 @@ impl Plane {
         let _ = self.events.send(event).await;
     }
 
-    async fn run(self, ws: UsWs, mut ws_events: mpsc::Receiver<UsWsEvent>) {
+    async fn run(
+        self,
+        ws: Sockets,
+        mut book_events: mpsc::Receiver<UsWsEvent>,
+        mut trade_events: mpsc::Receiver<UsWsEvent>,
+    ) {
         let mut state = State::default();
         let mut next = Instant::now();
+        let mut trades_open = true;
         loop {
             tokio::select! {
                 () = self.events.closed() => return,
@@ -195,27 +233,23 @@ impl Plane {
                     next = Instant::now() + Duration::from_millis(delay);
                     // A failed pass after a rejection leaves listed markets unsubscribed: retry soon.
                     if state.listed.keys().any(|slug| {
-                        SUBSCRIPTION_TYPES.iter().any(|(_, kind)| !state.subscriptions
-                            .iter().any(|(sub_kind, _, slugs)| sub_kind == kind && slugs.contains(slug)))
+                        SUBSCRIPTION_TYPES.iter().any(|(_, kind)| {
+                            !state.subscriptions.iter().any(|(sub_kind, _, slugs)| {
+                                sub_kind == kind && slugs.contains(slug)
+                            }) && !state.shed.iter().any(|(shed_kind, shed)| shed_kind == kind && shed == slug)
+                        })
                     }) {
                         next = next.min(Instant::now() + RESUBSCRIBE_AFTER);
                     }
                 }
-                event = ws_events.recv() => match event {
-                    Some(event) => {
-                        let rejected = self.handle(event, &state.listed).await;
-                        // A rejected live subscription leaves its markets unbooked: forget it (so the
-                        // socket does not replay it) and let discovery resubscribe them soon.
-                        if let Some(request_id) = rejected
-                            && let Some(index) =
-                                state.subscriptions.iter().position(|(_, id, _)| *id == request_id)
-                        {
-                            state.subscriptions.remove(index);
-                            ws.unsubscribe(&request_id);
-                            next = next.min(Instant::now() + RESUBSCRIBE_AFTER);
-                        }
-                    }
+                event = book_events.recv() => match event {
+                    Some(event) => self.on_frame(event, &ws, &mut state, &mut next).await,
                     None => return,
+                },
+                // The trades socket ending must not take the books down with it.
+                event = trade_events.recv(), if trades_open => match event {
+                    Some(event) => self.on_frame(event, &ws, &mut state, &mut next).await,
+                    None => trades_open = false,
                 },
                 Some(joined) = state.strikes.join_next(), if !state.strikes.is_empty() => {
                     if let Err(error) = joined {
@@ -226,8 +260,67 @@ impl Plane {
         }
     }
 
-    /// Report one markets-WebSocket event. Returns the request id of a rejected subscription.
-    async fn handle(&self, event: UsWsEvent, listed: &HashMap<String, UsWindow>) -> Option<String> {
+    /// Handle one WebSocket event. A rejected subscription leaves its markets uncovered: forget it
+    /// (so the socket does not replay it) and let discovery resubscribe them soon. When the
+    /// connection was full, an ended window gives way: a refused window that is still open or
+    /// ahead takes the slot of the oldest ended window on that connection at once, and a refused
+    /// ended window is not retried. So an open window is never refused for an ended one.
+    async fn on_frame(
+        &self,
+        event: UsWsEvent,
+        ws: &Sockets,
+        state: &mut State,
+        next: &mut Instant,
+    ) {
+        let Some((request_id, capped)) = self.handle(event, &state.listed).await else {
+            return;
+        };
+        let Some(index) = state
+            .subscriptions
+            .iter()
+            .position(|(_, id, _)| *id == request_id)
+        else {
+            return;
+        };
+        let (kind, _, slugs) = state.subscriptions.remove(index);
+        ws.of(kind).unsubscribe(&request_id);
+        *next = (*next).min(Instant::now() + RESUBSCRIBE_AFTER);
+        let Some((refused_start, refused_end)) = span(&state.listed, &slugs).filter(|_| capped)
+        else {
+            return;
+        };
+        let now = unix_ms() / 1000;
+        if refused_end <= now {
+            state
+                .shed
+                .extend(slugs.into_iter().map(|slug| (kind, slug)));
+            return;
+        }
+        let oldest_ended = state
+            .subscriptions
+            .iter()
+            .enumerate()
+            .filter(|(_, (sub_kind, _, _))| *sub_kind == kind)
+            .filter_map(|(index, (_, _, held))| Some((span(&state.listed, held)?, index)))
+            .filter(|((start, end), _)| *end <= now && *start < refused_start)
+            .min();
+        if let Some((_, index)) = oldest_ended {
+            let (_, evicted_id, evicted) = state.subscriptions.remove(index);
+            ws.of(kind).unsubscribe(&evicted_id);
+            state
+                .shed
+                .extend(evicted.into_iter().map(|slug| (kind, slug)));
+            *next = Instant::now();
+        }
+    }
+
+    /// Report one markets-WebSocket event. Returns the request id of a rejected subscription and
+    /// whether the venue refused it because the connection was full.
+    async fn handle(
+        &self,
+        event: UsWsEvent,
+        listed: &HashMap<String, UsWindow>,
+    ) -> Option<(String, bool)> {
         let frame = |raw| UsPlaneEvent::Frame {
             market_slug: None,
             venue_ts_ns: None,
@@ -246,13 +339,14 @@ impl Plane {
                 error,
                 raw,
             } => {
+                let capped = error.contains(CAP_REJECTION);
                 self.emit(UsPlaneEvent::Rejected {
                     request_id: request_id.clone(),
                     error,
                 })
                 .await;
                 self.emit(frame(raw)).await;
-                return Some(request_id);
+                return Some((request_id, capped));
             }
             UsWsEvent::MarketData { data, raw } => {
                 self.emit(UsPlaneEvent::Frame {
@@ -296,7 +390,7 @@ impl Plane {
     /// Discover the window markets and keep the WebSocket subscriptions and strike watches in
     /// step. A failed discovery keeps the last-good listing. Each body is reported before it is
     /// decoded, so a body that fails to decode is still kept.
-    async fn discover(&self, ws: &UsWs, state: &mut State) {
+    async fn discover(&self, ws: &Sockets, state: &mut State) {
         let now = unix_ms() / 1000;
         // The pairs `UsClient::markets` sends, plus the page offset, read raw so the body is reported.
         let query = [
@@ -367,18 +461,20 @@ impl Plane {
         self.emit(UsPlaneEvent::Listed(windows)).await;
 
         // The venue caps a connection at about 10 subscriptions and rejects a subscription naming a
-        // market another live subscription covers. So each window's markets share one subscription,
-        // dropped once none of them is listed (the venue lists only open windows), and only markets no
-        // live subscription covers are subscribed. A listed market never leaves its subscription, so
-        // its book stays continuous across window rolls, and since unsubscribes go out first, only
-        // listed markets are subscribed, whether the cap counts subscriptions or markets.
-        state.subscriptions.retain(|(_, request_id, slugs)| {
+        // market another live subscription covers. So each window's markets share one subscription
+        // per type, dropped once none of them is listed, and only markets no live subscription covers
+        // are subscribed. The venue keeps an ended window listed until it settles, up to 30 min, so a
+        // slow settlement lists more windows than one connection holds: `on_frame` then sheds ended
+        // windows first. A listed market otherwise never leaves its subscription, so its book stays
+        // continuous across window rolls, and unsubscribes go out first.
+        state.subscriptions.retain(|(kind, request_id, slugs)| {
             let live = slugs.iter().any(|slug| listed.contains_key(slug));
             if !live {
-                ws.unsubscribe(request_id);
+                ws.of(kind).unsubscribe(request_id);
             }
             live
         });
+        state.shed.retain(|(_, slug)| listed.contains_key(slug));
         state.subscription_seq += 1;
         for (prefix, subscription_type) in SUBSCRIPTION_TYPES {
             let covered: BTreeSet<&String> = state
@@ -389,7 +485,11 @@ impl Plane {
                 .collect();
             let mut uncovered: BTreeMap<(i64, &str), BTreeSet<String>> = BTreeMap::new();
             for (slug, entry) in &listed {
-                if !covered.contains(slug) {
+                let shed = state
+                    .shed
+                    .iter()
+                    .any(|(kind, shed)| *kind == subscription_type && shed == slug);
+                if !covered.contains(slug) && !shed {
                     uncovered
                         .entry((entry.window_start, entry.horizon.as_str()))
                         .or_default()
@@ -398,7 +498,7 @@ impl Plane {
             }
             for (group, market_slugs) in uncovered.into_values().enumerate() {
                 let request_id = format!("{prefix}:set:{}:{group}", state.subscription_seq);
-                ws.subscribe(UsSubscription {
+                ws.of(subscription_type).subscribe(UsSubscription {
                     request_id: request_id.clone(),
                     subscription_type,
                     market_slugs: market_slugs.iter().cloned().collect(),

@@ -4,21 +4,29 @@
 */
 //! Polymarket platform fees: the one fee formula every consumer reads.
 //!
-//! A market's metadata supplies the fee coefficient (`fd.r`, or the US `feeCoefficient`) and its
-//! power exponent (`fd.e`). A taker pays, per share, at the fill price `p`:
+//! Polymarket US (<https://docs.polymarket.us/fees>) charges a taker, per fill of `C` contracts
+//! at price `p`:
 //!
 //! ```text
-//! fee per share = rate × (p × (1 − p))^exponent
-//! fee           = shares × fee per share, rounded to 5 decimals
+//! fee = Θ × C × p × (1 − p)        rounded to $0.01, round half to even
 //! ```
 //!
-//! A maker pays nothing, and redemption at settlement is free. The fee comes out of the money
-//! that crosses the book, never from outside it: a buy's bid pays the shares and their fee
-//! ([`Fees::shares_for_bid`]), and a sale's proceeds are its notional less the fee
-//! ([`Fees::proceeds`]), so a trade never loses more than its bid.
+//! where `Θ` is the taker coefficient: tiered by trailing 30-day volume for app and web orders,
+//! a flat 0.0695 for API orders. A maker pays the maker coefficient on the same curve, which is
+//! zero or negative (a rebate credited at the fill) by maker tier. Taker rebates (the API
+//! program's 70%, or the volume tiers) are a share of the taker fee paid back later, so they
+//! never reduce what a fill charges. Across one order's fills the total charged never exceeds
+//! the rounding of the order's exact fee ([`Fees::order_fees`]). The international CLOB uses the
+//! same curve with a market-supplied exponent and five-decimal rounding.
+//!
+//! The venue takes the taker fee from the balance at the fill, on top of the notional. Sizing
+//! takes it out of the bid instead ([`Fees::shares_for_bid`]), so notional plus fee never
+//! exceeds the bid and a trade never loses more than it bid. A sale pays out its notional less
+//! the fee ([`Fees::proceeds`]); redemption at settlement is free.
 //!
 //! [`Fees`] is generic over the number: [`Decimal`] for money that settles, `f64` for model
-//! arithmetic (sizing, edge gates). Both run the same formula.
+//! arithmetic (sizing, edge gates). Both run the same formula. Every coefficient is a parameter;
+//! the account's tier and program come from configuration, never from this crate.
 
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -67,7 +75,7 @@ pub enum WindowKind {
     W4h,
 }
 
-/// Which side of the book a fill takes: the taker pays the fee, the maker pays nothing.
+/// Which side of the book a fill takes.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[cfg_attr(
     feature = "serde",
@@ -75,33 +83,69 @@ pub enum WindowKind {
     serde(rename_all = "snake_case")
 )]
 pub enum Liquidity {
-    /// Crosses the book (a market or FAK/FOK order, or a limit that matches at once).
+    /// Removes liquidity: a market or FAK/FOK order, or a limit that matches at once.
     #[default]
     Taker,
-    /// Rests on the book and is matched later.
+    /// Adds liquidity: a resting order matched later.
     Maker,
+}
+
+/// How a venue rounds a fee amount.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum FeeRounding {
+    /// The international CLOB: five decimals, midpoint away from zero.
+    #[default]
+    FiveDecimals,
+    /// Polymarket US: whole cents, round half to even (banker's rounding).
+    Cents,
+}
+
+impl FeeRounding {
+    const fn places(self) -> u32 {
+        match self {
+            Self::FiveDecimals => POLYMARKET_FEE_PRECISION,
+            Self::Cents => 2,
+        }
+    }
+
+    const fn half_even(self) -> bool {
+        matches!(self, Self::Cents)
+    }
 }
 
 /// A number the fee formula runs on: [`Decimal`] or `f64`.
 pub trait FeeScalar: Copy + PartialOrd {
     const ZERO: Self;
     const ONE: Self;
-    /// The smallest fee the venue charges, `0.00001`.
-    fn fee_tick() -> Self;
+    /// One unit in the last place `rounding` keeps: `0.01` or `0.00001`.
+    fn tick(rounding: FeeRounding) -> Self;
+    /// Rounds to the places `rounding` keeps, half to even or half away from zero.
+    fn round_fee(self, rounding: FeeRounding) -> Self;
     fn checked_add(self, other: Self) -> Option<Self>;
     fn checked_sub(self, other: Self) -> Option<Self>;
     fn checked_mul(self, other: Self) -> Option<Self>;
     fn checked_div(self, other: Self) -> Option<Self>;
-    /// Rounds a fee amount to [`POLYMARKET_FEE_PRECISION`] places, midpoint away from zero.
-    fn round_fee(self) -> Self;
 }
 
 impl FeeScalar for Decimal {
     const ZERO: Self = Decimal::ZERO;
     const ONE: Self = Decimal::ONE;
 
-    fn fee_tick() -> Self {
-        Decimal::new(1, POLYMARKET_FEE_PRECISION)
+    fn tick(rounding: FeeRounding) -> Self {
+        Decimal::new(1, rounding.places())
+    }
+    fn round_fee(self, rounding: FeeRounding) -> Self {
+        let strategy = if rounding.half_even() {
+            RoundingStrategy::MidpointNearestEven
+        } else {
+            RoundingStrategy::MidpointAwayFromZero
+        };
+        self.round_dp_with_strategy(rounding.places(), strategy)
     }
     fn checked_add(self, other: Self) -> Option<Self> {
         Decimal::checked_add(self, other)
@@ -115,20 +159,24 @@ impl FeeScalar for Decimal {
     fn checked_div(self, other: Self) -> Option<Self> {
         Decimal::checked_div(self, other)
     }
-    fn round_fee(self) -> Self {
-        self.round_dp_with_strategy(
-            POLYMARKET_FEE_PRECISION,
-            RoundingStrategy::MidpointAwayFromZero,
-        )
-    }
 }
 
 impl FeeScalar for f64 {
     const ZERO: Self = 0.0;
     const ONE: Self = 1.0;
 
-    fn fee_tick() -> Self {
-        1e-5
+    fn tick(rounding: FeeRounding) -> Self {
+        10f64.powi(-(rounding.places() as i32))
+    }
+    fn round_fee(self, rounding: FeeRounding) -> Self {
+        let scale = 10f64.powi(rounding.places() as i32);
+        let scaled = self * scale;
+        let rounded = if rounding.half_even() {
+            scaled.round_ties_even()
+        } else {
+            scaled.round()
+        };
+        rounded / scale
     }
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(self + other).filter(|value| value.is_finite())
@@ -142,24 +190,36 @@ impl FeeScalar for f64 {
     fn checked_div(self, other: Self) -> Option<Self> {
         Some(self / other).filter(|value| value.is_finite())
     }
-    fn round_fee(self) -> Self {
-        // `f64::round` rounds half away from zero, like the Decimal path.
-        (self * 1e5).round() / 1e5
-    }
 }
 
-/// A market's platform-fee schedule: `rate × (p × (1 − p))^exponent` per taker share.
+/// A fee schedule: the taker and maker coefficients on the `(p × (1 − p))^exponent` curve, the
+/// share of the taker fee paid back later, and the venue's rounding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
-    serde(rename_all = "snake_case")
+    serde(bound(deserialize = "T: serde::Deserialize<'de> + FeeScalar"))
 )]
 pub struct Fees<T = Decimal> {
+    /// Θ for a taker fill (`fd.r`, or the US `feeCoefficient` or tier coefficient).
     #[cfg_attr(feature = "serde", serde(rename = "fee_rate"))]
-    rate: T,
+    taker: T,
+    /// The curve's exponent (`fd.e`; 1 on Polymarket US).
     #[cfg_attr(feature = "serde", serde(rename = "fee_exponent"))]
     exponent: u32,
+    /// Θ for a maker fill: zero, or negative for a maker rebate.
+    #[cfg_attr(feature = "serde", serde(default = "zero"))]
+    maker: T,
+    /// The share of a taker fee paid back later (`0.70` for the US API program).
+    #[cfg_attr(feature = "serde", serde(default = "zero"))]
+    taker_rebate: T,
+    #[cfg_attr(feature = "serde", serde(default))]
+    rounding: FeeRounding,
+}
+
+#[cfg(feature = "serde")]
+fn zero<T: FeeScalar>() -> T {
+    T::ZERO
 }
 
 /// The exact schedule, as market metadata states it.
@@ -168,35 +228,110 @@ pub type FeeCalculator = Fees<Decimal>;
 // The negated comparisons are deliberate: a NaN `f64` fails every check, so it is refused.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 impl<T: FeeScalar> Fees<T> {
-    /// The schedule from a market's metadata: `fd.r` (or the US `feeCoefficient`) and `fd.e`.
+    /// A taker-only schedule from market metadata, rounded as the international CLOB rounds:
+    /// no maker fee and no taker rebate until set.
     ///
     /// # Errors
     ///
-    /// Returns [`PowerFeeError::NegativeRate`] when `rate` is negative (or not a number).
-    pub fn new(rate: T, exponent: u32) -> Result<Self, PowerFeeError> {
-        if !(rate >= T::ZERO) {
+    /// [`PowerFeeError::NegativeRate`] when `taker` is negative or not a number.
+    pub fn new(taker: T, exponent: u32) -> Result<Self, PowerFeeError> {
+        if !(taker >= T::ZERO) {
             return Err(PowerFeeError::NegativeRate);
         }
-        Ok(Self { rate, exponent })
+        Ok(Self {
+            taker,
+            exponent,
+            maker: T::ZERO,
+            taker_rebate: T::ZERO,
+            rounding: FeeRounding::FiveDecimals,
+        })
     }
 
-    /// The fee-rate coefficient.
+    /// A Polymarket US schedule: `Θ × C × p × (1 − p)`, whole cents, half to even. `taker` is the
+    /// account's Θ (tier or program); set the maker rebate and taker rebate from configuration.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fees::new`].
+    pub fn us(taker: T) -> Result<Self, PowerFeeError> {
+        Ok(Self::new(taker, 1)?.with_rounding(FeeRounding::Cents))
+    }
+
+    /// The maker coefficient: zero, or negative for a maker rebate credited at the fill.
+    ///
+    /// # Errors
+    ///
+    /// [`PowerFeeError::NegativeRate`] when `maker` is not a number or a rebate larger than the
+    /// taker fee.
+    pub fn with_maker(mut self, maker: T) -> Result<Self, PowerFeeError> {
+        let floor = T::ZERO
+            .checked_sub(self.taker)
+            .ok_or(PowerFeeError::ArithmeticOverflow)?;
+        if !(maker >= floor) {
+            return Err(PowerFeeError::NegativeRate);
+        }
+        self.maker = maker;
+        Ok(self)
+    }
+
+    /// The share of each taker fee paid back later, in `[0, 1]`.
+    ///
+    /// # Errors
+    ///
+    /// [`PowerFeeError::NegativeRate`] outside `[0, 1]`.
+    pub fn with_taker_rebate(mut self, rebate: T) -> Result<Self, PowerFeeError> {
+        if !(T::ZERO <= rebate && rebate <= T::ONE) {
+            return Err(PowerFeeError::NegativeRate);
+        }
+        self.taker_rebate = rebate;
+        Ok(self)
+    }
+
+    /// The venue's rounding.
+    pub const fn with_rounding(mut self, rounding: FeeRounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+
+    /// The taker coefficient Θ.
     pub const fn rate(&self) -> T {
-        self.rate
+        self.taker
     }
 
-    /// The power exponent.
+    /// The maker coefficient.
+    pub const fn maker(&self) -> T {
+        self.maker
+    }
+
+    /// The share of a taker fee paid back later.
+    pub const fn taker_rebate(&self) -> T {
+        self.taker_rebate
+    }
+
+    /// The curve's exponent.
     pub const fn exponent(&self) -> u32 {
         self.exponent
     }
 
-    /// Whether the schedule charges nothing at any price.
-    pub fn is_free(&self) -> bool {
-        self.rate == T::ZERO
+    /// The venue's rounding.
+    pub const fn rounding(&self) -> FeeRounding {
+        self.rounding
     }
 
-    /// The fee on one share at `price`, unrounded: `rate × (p × (1 − p))^exponent` for a
-    /// taker, zero for a maker.
+    /// Whether a taker fill pays nothing at any price.
+    pub fn is_free(&self) -> bool {
+        self.taker == T::ZERO
+    }
+
+    const fn coefficient(&self, liquidity: Liquidity) -> T {
+        match liquidity {
+            Liquidity::Taker => self.taker,
+            Liquidity::Maker => self.maker,
+        }
+    }
+
+    /// The fee on one contract at `price`, unrounded: `Θ × (p × (1 − p))^exponent`, with the
+    /// taker or maker Θ. Negative for a maker rebate.
     ///
     /// # Errors
     ///
@@ -205,7 +340,8 @@ impl<T: FeeScalar> Fees<T> {
         if !(T::ZERO <= price && price <= T::ONE) {
             return Err(PowerFeeError::PriceOutOfBounds);
         }
-        if liquidity == Liquidity::Maker || self.is_free() {
+        let theta = self.coefficient(liquidity);
+        if theta == T::ZERO {
             return Ok(T::ZERO);
         }
         let base = T::ONE
@@ -213,26 +349,101 @@ impl<T: FeeScalar> Fees<T> {
             .and_then(|complement| price.checked_mul(complement))
             .ok_or(PowerFeeError::ArithmeticOverflow)?;
         pow(base, self.exponent)
-            .and_then(|curve| self.rate.checked_mul(curve))
+            .and_then(|curve| theta.checked_mul(curve))
             .ok_or(PowerFeeError::ArithmeticOverflow)
     }
 
-    /// The fee on `shares` filled at `price`, rounded to five decimals as the venue charges it.
-    ///
-    /// # Errors
-    ///
-    /// Non-positive `shares`, a `price` outside `[0, 1]`, or arithmetic that overflows.
-    pub fn fee(&self, liquidity: Liquidity, shares: T, price: T) -> Result<T, PowerFeeError> {
+    fn exact(&self, liquidity: Liquidity, shares: T, price: T) -> Result<T, PowerFeeError> {
         if !(shares > T::ZERO) {
             return Err(PowerFeeError::NonPositiveShares);
         }
         self.per_share(liquidity, price)?
             .checked_mul(shares)
-            .map(T::round_fee)
             .ok_or(PowerFeeError::ArithmeticOverflow)
     }
 
-    /// What a buy of `shares` at `price` takes from the bid: notional plus fee.
+    /// What one fill of `shares` at `price` charges, rounded as the venue rounds it. Negative
+    /// for a maker rebate.
+    ///
+    /// # Errors
+    ///
+    /// Non-positive `shares`, a `price` outside `[0, 1]`, or arithmetic that overflows.
+    pub fn fee(&self, liquidity: Liquidity, shares: T, price: T) -> Result<T, PowerFeeError> {
+        Ok(self
+            .exact(liquidity, shares, price)?
+            .round_fee(self.rounding))
+    }
+
+    /// What one order's taker fills charge, fill by fill: each fill's rounded fee, cut from the
+    /// last fill back so the total never exceeds the rounding of the order's exact fee. Maker
+    /// fills are charged each on its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fees::fee`], for any fill.
+    pub fn order_fees(
+        &self,
+        liquidity: Liquidity,
+        fills: &[(T, T)],
+    ) -> Result<Vec<T>, PowerFeeError> {
+        let mut charged = Vec::with_capacity(fills.len());
+        let mut exact_total = T::ZERO;
+        let mut charged_total = T::ZERO;
+        for &(shares, price) in fills {
+            let exact = self.exact(liquidity, shares, price)?;
+            let fee = exact.round_fee(self.rounding);
+            exact_total = exact_total
+                .checked_add(exact)
+                .ok_or(PowerFeeError::ArithmeticOverflow)?;
+            charged_total = charged_total
+                .checked_add(fee)
+                .ok_or(PowerFeeError::ArithmeticOverflow)?;
+            charged.push(fee);
+        }
+        if liquidity == Liquidity::Maker {
+            return Ok(charged);
+        }
+        let mut excess = charged_total
+            .checked_sub(exact_total.round_fee(self.rounding))
+            .ok_or(PowerFeeError::ArithmeticOverflow)?;
+        for fee in charged.iter_mut().rev() {
+            if !(excess > T::ZERO) {
+                break;
+            }
+            let cut = if excess < *fee { excess } else { *fee };
+            *fee = fee
+                .checked_sub(cut)
+                .ok_or(PowerFeeError::ArithmeticOverflow)?;
+            excess = excess
+                .checked_sub(cut)
+                .ok_or(PowerFeeError::ArithmeticOverflow)?;
+        }
+        Ok(charged)
+    }
+
+    /// A fill's fee less the taker rebate paid back later: the fee's economic cost once the
+    /// rebate arrives. Unrounded, since the venue does not state how a rebate rounds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fees::fee`].
+    pub fn fee_after_rebate(
+        &self,
+        liquidity: Liquidity,
+        shares: T,
+        price: T,
+    ) -> Result<T, PowerFeeError> {
+        let fee = self.fee(liquidity, shares, price)?;
+        if liquidity == Liquidity::Maker {
+            return Ok(fee);
+        }
+        T::ONE
+            .checked_sub(self.taker_rebate)
+            .and_then(|kept| fee.checked_mul(kept))
+            .ok_or(PowerFeeError::ArithmeticOverflow)
+    }
+
+    /// What a buy of `shares` at `price` takes at the fill: notional plus fee.
     ///
     /// # Errors
     ///
@@ -245,7 +456,7 @@ impl<T: FeeScalar> Fees<T> {
             .ok_or(PowerFeeError::ArithmeticOverflow)
     }
 
-    /// What a sale of `shares` at `price` pays out: notional less fee.
+    /// What a sale of `shares` at `price` pays at the fill: notional less fee.
     ///
     /// # Errors
     ///
@@ -262,18 +473,18 @@ impl<T: FeeScalar> Fees<T> {
     /// [`Fees::cost`] never exceeds it:
     ///
     /// ```text
-    /// shares = (bid − tick) / (p + rate × (p × (1 − p))^exponent)
+    /// shares = (bid − tick) / (p + Θ × (p × (1 − p))^exponent)
     /// ```
     ///
-    /// One fee tick is held back because the fee rounds to five decimals. A fill at a lower price
-    /// costs less per share (`d/dp [p + r·p(1−p)] = 1 + r(1 − 2p) > 0` for `r < 1`), and a venue
-    /// grid only floors shares, so neither can push the spend past the bid. A maker leg, or a free
-    /// schedule, buys exactly `bid / price`.
+    /// One rounding tick is held back because the rounded fee can exceed the exact fee by half a
+    /// tick. A fill at a lower price costs less per share (`d/dp [p + Θ·p(1−p)] = 1 + Θ(1 − 2p) >
+    /// 0` for `Θ < 1`), and a venue grid only floors shares, so neither pushes the spend past the
+    /// bid. A leg that pays nothing (a free schedule, or a maker without a fee) buys exactly
+    /// `bid / price`; a maker rebate is not spent ahead of its credit.
     ///
     /// # Errors
     ///
-    /// A non-positive `bid` (or one no larger than the tick), a `price` outside `(0, 1]`, or
-    /// arithmetic that overflows.
+    /// A `bid` no larger than the tick, a `price` outside `(0, 1]`, or arithmetic that overflows.
     pub fn shares_for_bid(
         &self,
         liquidity: Liquidity,
@@ -284,11 +495,13 @@ impl<T: FeeScalar> Fees<T> {
             return Err(PowerFeeError::PriceOutOfBounds);
         }
         let per_share = self.per_share(liquidity, price)?;
-        let spendable = if per_share == T::ZERO {
-            bid
+        let (spendable, per_share) = if per_share > T::ZERO {
+            let spendable = bid
+                .checked_sub(T::tick(self.rounding))
+                .ok_or(PowerFeeError::ArithmeticOverflow)?;
+            (spendable, per_share)
         } else {
-            bid.checked_sub(T::fee_tick())
-                .ok_or(PowerFeeError::ArithmeticOverflow)?
+            (bid, T::ZERO)
         };
         if !(spendable > T::ZERO) {
             return Err(PowerFeeError::NonPositiveShares);
@@ -311,12 +524,15 @@ impl Fees<Decimal> {
         Self::new(rate, exponent)
     }
 
-    /// The current Crypto schedule: rate `0.07`, exponent `1`. Metadata stays authoritative
-    /// for live markets.
+    /// The international CLOB's current Crypto schedule: rate `0.07`, exponent `1`. Metadata
+    /// stays authoritative for live markets.
     pub const fn crypto() -> Self {
         Self {
-            rate: CURRENT_CRYPTO_RATE,
+            taker: CURRENT_CRYPTO_RATE,
             exponent: CURRENT_CRYPTO_EXPONENT,
+            maker: Decimal::ZERO,
+            taker_rebate: Decimal::ZERO,
+            rounding: FeeRounding::FiveDecimals,
         }
     }
 
@@ -324,34 +540,36 @@ impl Fees<Decimal> {
     ///
     /// # Errors
     ///
-    /// [`PowerFeeError::FloatConversion`] when the rate has no finite `f64`.
+    /// [`PowerFeeError::FloatConversion`] when a coefficient has no finite `f64`.
     pub fn to_f64(&self) -> Result<Fees<f64>, PowerFeeError> {
-        let rate = f64::try_from(self.rate).map_err(|_| PowerFeeError::FloatConversion)?;
-        Fees::new(rate, self.exponent)
+        let float =
+            |value: Decimal| f64::try_from(value).map_err(|_| PowerFeeError::FloatConversion);
+        Ok(Fees {
+            taker: float(self.taker)?,
+            exponent: self.exponent,
+            maker: float(self.maker)?,
+            taker_rebate: float(self.taker_rebate)?,
+            rounding: self.rounding,
+        })
     }
 
-    /// The V2 `fd.r` coefficient.
+    /// The taker coefficient under its V2 metadata name, `fd.r`.
     pub const fn fee_rate(&self) -> Decimal {
-        self.rate
+        self.taker
     }
 
-    /// The V2 `fd.e` exponent.
+    /// The exponent under its V2 metadata name, `fd.e`.
     pub const fn fee_exponent(&self) -> u32 {
         self.exponent
     }
 
-    /// The taker fee on `shares` at `price`, rounded to five decimals.
+    /// The taker fee on `shares` at `price`, rounded as the venue rounds it.
     ///
     /// # Errors
     ///
     /// As [`Fees::fee`].
     pub fn taker_fee(&self, shares: Decimal, price: Decimal) -> Result<Decimal, PowerFeeError> {
         self.fee(Liquidity::Taker, shares, price)
-    }
-
-    /// The maker fee, exactly zero.
-    pub const fn maker_fee(&self) -> Decimal {
-        Decimal::ZERO
     }
 
     /// [`Fees::taker_fee`] for callers that still hold `f64`: the inputs become [`Decimal`]
@@ -365,6 +583,53 @@ impl Fees<Decimal> {
         let price = Decimal::try_from(price).map_err(|_| PowerFeeError::FloatConversion)?;
         let fee = self.taker_fee(shares, price)?;
         f64::try_from(fee).map_err(|_| PowerFeeError::FloatConversion)
+    }
+}
+
+/// The fee schedule an account trades under over time: a promotional program until it ends, then
+/// the account's volume tier. Polymarket US fixes an order's coefficients when the order is
+/// inserted, so look the schedule up at the insert time.
+///
+/// `At` is whatever instant the caller keeps (`chrono::DateTime<Utc>`, Unix seconds); the program
+/// covers instants strictly before its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(bound(
+        deserialize = "T: serde::Deserialize<'de> + FeeScalar, At: serde::Deserialize<'de>"
+    ))
+)]
+pub struct FeePlan<T, At> {
+    /// The account's schedule outside any program.
+    pub tier: Fees<T>,
+    /// A program and the instant it ends: the US API program (Θ 0.0695, 70% taker rebate) runs
+    /// through 2026-12-31.
+    pub program: Option<FeeProgram<T, At>>,
+}
+
+/// A dated fee program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(bound(
+        deserialize = "T: serde::Deserialize<'de> + FeeScalar, At: serde::Deserialize<'de>"
+    ))
+)]
+pub struct FeeProgram<T, At> {
+    pub fees: Fees<T>,
+    /// The first instant the program no longer covers.
+    pub ends: At,
+}
+
+impl<T: FeeScalar, At: PartialOrd> FeePlan<T, At> {
+    /// The schedule an order inserted at `at` pays.
+    pub fn at(&self, at: &At) -> &Fees<T> {
+        match &self.program {
+            Some(program) if *at < program.ends => &program.fees,
+            _ => &self.tier,
+        }
     }
 }
 
@@ -416,11 +681,145 @@ mod tests {
     }
 
     #[test]
-    fn maker_fee_is_exactly_zero() {
+    fn a_metadata_schedule_charges_makers_nothing() {
         let calculator = FeeCalculator::from_market_metadata(Decimal::new(7, 2), 2)
             .expect("fd.r=0.07 and fd.e=2 are valid");
 
-        assert_eq!(calculator.maker_fee(), Decimal::ZERO);
+        assert_eq!(
+            calculator.fee(Liquidity::Maker, Decimal::ONE_HUNDRED, Decimal::new(5, 1)),
+            Ok(Decimal::ZERO)
+        );
+    }
+
+    fn us_api() -> Fees<Decimal> {
+        Fees::us(Decimal::new(695, 4))
+            .unwrap()
+            .with_maker(Decimal::new(-104, 4))
+            .unwrap()
+            .with_taker_rebate(Decimal::new(70, 2))
+            .unwrap()
+    }
+
+    /// The worked examples on <https://docs.polymarket.us/fees>: Θ 0.0695 on 100 contracts.
+    #[test]
+    fn us_schedule_matches_the_published_examples() {
+        let fees = us_api();
+        let fee = |price: i64| {
+            fees.fee(
+                Liquidity::Taker,
+                Decimal::ONE_HUNDRED,
+                Decimal::new(price, 2),
+            )
+        };
+        assert_eq!(fee(10), Ok(Decimal::new(63, 2))); // 0.6255
+        assert_eq!(fee(30), Ok(Decimal::new(146, 2))); // 1.4595
+        assert_eq!(fee(65), Ok(Decimal::new(158, 2))); // 1.581125
+        assert_eq!(fee(50), Ok(Decimal::new(174, 2))); // 1.7375
+        // Tier 4 maker rebate at 0.10: −0.0104 × 100 × 0.09 = −0.0936 → −0.09, credited at the fill.
+        assert_eq!(
+            fees.fee(Liquidity::Maker, Decimal::ONE_HUNDRED, Decimal::new(10, 2)),
+            Ok(Decimal::new(-9, 2))
+        );
+        // The 70% API rebate is paid back on the taker fee; makers keep their rebate whole.
+        assert_eq!(
+            fees.fee_after_rebate(Liquidity::Taker, Decimal::ONE_HUNDRED, Decimal::new(50, 2)),
+            Ok(Decimal::new(5220, 4))
+        );
+        assert_eq!(
+            fees.fee_after_rebate(Liquidity::Maker, Decimal::ONE_HUNDRED, Decimal::new(10, 2)),
+            Ok(Decimal::new(-9, 2))
+        );
+    }
+
+    #[test]
+    fn cents_round_half_to_even() {
+        let half_even = |x: Decimal| x.round_fee(FeeRounding::Cents);
+        assert_eq!(half_even(Decimal::new(25, 3)), Decimal::new(2, 2));
+        assert_eq!(half_even(Decimal::new(35, 3)), Decimal::new(4, 2));
+        assert_eq!(0.025_f64.round_fee(FeeRounding::Cents), 0.02);
+        assert_eq!(0.035_f64.round_fee(FeeRounding::Cents), 0.04);
+        assert_eq!(
+            Decimal::new(25, 3).round_fee(FeeRounding::FiveDecimals),
+            Decimal::new(25, 3)
+        );
+    }
+
+    /// Ten fills of 1 contract at 0.50 each round to 0.02 (0.017375); the order's exact fee is
+    /// 0.17375 → 0.17, so the last fill gives back 0.03 of the 0.20 charged.
+    #[test]
+    fn an_order_never_pays_more_than_its_rounded_exact_fee() {
+        let fees = us_api();
+        let fills = [(Decimal::ONE, Decimal::new(50, 2)); 10];
+        let charged = fees.order_fees(Liquidity::Taker, &fills).unwrap();
+        assert_eq!(
+            charged.iter().copied().sum::<Decimal>(),
+            Decimal::new(17, 2)
+        );
+        assert_eq!(charged[9], Decimal::ZERO);
+        assert_eq!(charged[8], Decimal::new(1, 2));
+        assert!(charged[..8].iter().all(|fee| *fee == Decimal::new(2, 2)));
+        // A single fill is its own order.
+        assert_eq!(
+            fees.order_fees(
+                Liquidity::Taker,
+                &[(Decimal::ONE_HUNDRED, Decimal::new(50, 2))]
+            ),
+            Ok(vec![Decimal::new(174, 2)])
+        );
+    }
+
+    #[test]
+    fn a_us_bid_pays_the_shares_and_their_cent_rounded_fee() {
+        let model = us_api().to_f64().unwrap();
+        for bid in [1.0_f64, 4.0, 25.0, 100.0] {
+            for cents in 5..=95 {
+                let ask = f64::from(cents) / 100.0;
+                let shares = model.shares_for_bid(Liquidity::Taker, bid, ask).unwrap();
+                let spend = model.cost(Liquidity::Taker, shares, ask).unwrap();
+                assert!(spend <= bid + 1e-12, "bid {bid} ask {ask}: spend {spend}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rebate_above_the_taker_fee_or_outside_one_is_refused() {
+        let fees = Fees::us(Decimal::new(695, 4)).unwrap();
+        assert_eq!(
+            fees.with_maker(Decimal::new(-1, 1)),
+            Err(PowerFeeError::NegativeRate)
+        );
+        assert_eq!(
+            fees.with_taker_rebate(Decimal::new(11, 1)),
+            Err(PowerFeeError::NegativeRate)
+        );
+        assert_eq!(
+            fees.with_taker_rebate(Decimal::NEGATIVE_ONE),
+            Err(PowerFeeError::NegativeRate)
+        );
+    }
+
+    /// The API program covers orders inserted before its end, then the volume tier applies.
+    #[test]
+    fn a_program_gives_way_to_the_tier_when_it_ends() {
+        let tier = Fees::us(Decimal::new(11, 2)).unwrap();
+        let plan = FeePlan {
+            tier,
+            program: Some(FeeProgram {
+                fees: us_api(),
+                ends: 1_798_761_600_i64,
+            }), // 2027-01-01Z
+        };
+        assert_eq!(plan.at(&1_798_761_599).rate(), Decimal::new(695, 4));
+        assert_eq!(plan.at(&1_798_761_599).taker_rebate(), Decimal::new(70, 2));
+        assert_eq!(plan.at(&1_798_761_600), &tier);
+        assert_eq!(
+            FeePlan::<Decimal, i64> {
+                tier,
+                program: None
+            }
+            .at(&0),
+            &tier
+        );
     }
 
     #[test]

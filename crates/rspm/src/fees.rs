@@ -24,9 +24,15 @@
 //! exceeds the bid and a trade never loses more than it bid. A sale pays out its notional less
 //! the fee ([`Fees::proceeds`]); redemption at settlement is free.
 //!
-//! [`Fees`] is generic over the number: [`Decimal`] for money that settles, `f64` for model
-//! arithmetic (sizing, edge gates). Both run the same formula. Every coefficient is a parameter;
-//! the account's tier and program come from configuration, never from this crate.
+//! [`Fees<T, S>`](Fees) is generic over the number and the venue. `T` is [`Decimal`] for money
+//! that settles or `f64` for model arithmetic (sizing, edge gates). `S` is a [`FeeSchedule`]
+//! marker naming the venue: its rounding and its standard coefficients. [`Pmus`] is Polymarket US
+//! ([`PmusFees`]), [`Clob`] the international CLOB ([`FeeCalculator`]). The formula is written
+//! once, on the generic impl; a venue only supplies amounts. Another venue, or a consumer's own
+//! schedule (a paper venue, say), is a new marker, never a second formula. Each instance carries
+//! the account's coefficients (tier, program, market metadata), which come from configuration.
+
+use core::marker::PhantomData;
 
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -192,16 +198,111 @@ impl FeeScalar for f64 {
     }
 }
 
-/// A fee schedule: the taker and maker coefficients on the `(p × (1 − p))^exponent` curve, the
-/// share of the taker fee paid back later, and the venue's rounding.
+/// A venue's fee schedule: how it rounds a fee and its standard coefficients. Implemented by
+/// fieldless markers ([`Pmus`], [`Clob`]) that type a [`Fees`]; the arithmetic never varies by
+/// venue, only these amounts.
+pub trait FeeSchedule:
+    Copy + Default + core::fmt::Debug + Eq + core::hash::Hash + Send + Sync + 'static
+{
+    /// A short name for logs.
+    const NAME: &'static str;
+    /// How the venue rounds each fill's fee.
+    const ROUNDING: FeeRounding;
+    /// The curve's standard exponent.
+    const EXPONENT: u32;
+    /// The standard taker Θ: what an account with no tier or program pays.
+    const TAKER: Decimal;
+    /// The standard maker Θ: zero, or negative for a rebate.
+    const MAKER: Decimal;
+    /// The standard share of a taker fee paid back later.
+    const TAKER_REBATE: Decimal;
+}
+
+/// Polymarket US (<https://docs.polymarket.us/fees>): `Θ × C × p × (1 − p)`, whole cents, half to
+/// even. The standard Θ is taker tier 1, the app and web rate a market's `feeCoefficient` carries.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Pmus;
+
+impl FeeSchedule for Pmus {
+    const NAME: &'static str = "polymarket-us";
+    const ROUNDING: FeeRounding = FeeRounding::Cents;
+    const EXPONENT: u32 = 1;
+    const TAKER: Decimal = Self::TAKER_TIERS[0];
+    const MAKER: Decimal = Decimal::ZERO;
+    const TAKER_REBATE: Decimal = Decimal::ZERO;
+}
+
+impl Pmus {
+    /// The API program: every API taker fill pays Θ 0.0695 and gets 70% of that fee back weekly,
+    /// 12:01 AM ET 2026-11-21 through 2026-12-31 ET, straight trades only. Add the account's maker
+    /// rebate with [`Fees::with_maker`]; the end date belongs in configuration ([`FeePlan`]).
+    pub const API: PmusFees = Fees {
+        taker: Decimal::from_parts(695, 0, 0, false, 4),
+        exponent: 1,
+        maker: Decimal::ZERO,
+        taker_rebate: Decimal::from_parts(70, 0, 0, false, 2),
+        schedule: PhantomData,
+    };
+
+    /// App and web taker Θ by taker fee tier 1 to 4 (trailing 30-day taker volume below $10k,
+    /// to $50k, to $250k, above), from 9:45 PM ET 2026-11-25.
+    pub const TAKER_TIERS: [Decimal; 4] = [
+        Decimal::from_parts(11, 0, 0, false, 2),
+        Decimal::from_parts(10, 0, 0, false, 2),
+        Decimal::from_parts(9, 0, 0, false, 2),
+        Decimal::from_parts(695, 0, 0, false, 4),
+    ];
+
+    /// Maker Θ by maker rebate tier 1 to 4 (qualifying maker volume below $10M, to $50M, to
+    /// $200M, above), credited at the fill.
+    pub const MAKER_TIERS: [Decimal; 4] = [
+        Decimal::ZERO,
+        Decimal::from_parts(35, 0, 0, true, 4),
+        Decimal::from_parts(70, 0, 0, true, 4),
+        Decimal::from_parts(104, 0, 0, true, 4),
+    ];
+
+    /// Share of taker fees paid back weekly by taker rebate tier 1 to 6 (qualifying taker
+    /// volume below $250k, to $1M, to $10M, to $25M, to $50M, above). Set independently of the
+    /// taker fee tier.
+    pub const TAKER_REBATE_TIERS: [Decimal; 6] = [
+        Decimal::ZERO,
+        Decimal::from_parts(3, 0, 0, false, 2),
+        Decimal::from_parts(5, 0, 0, false, 2),
+        Decimal::from_parts(10, 0, 0, false, 2),
+        Decimal::from_parts(15, 0, 0, false, 2),
+        Decimal::from_parts(30, 0, 0, false, 2),
+    ];
+}
+
+/// The international CLOB: rate and exponent from each market's `fd.r` and `fd.e`, five decimals,
+/// midpoint away from zero. The standard is the current Crypto schedule, rate `0.07`, exponent 1.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Clob;
+
+impl FeeSchedule for Clob {
+    const NAME: &'static str = "polymarket-clob";
+    const ROUNDING: FeeRounding = FeeRounding::FiveDecimals;
+    const EXPONENT: u32 = CURRENT_CRYPTO_EXPONENT;
+    const TAKER: Decimal = CURRENT_CRYPTO_RATE;
+    const MAKER: Decimal = Decimal::ZERO;
+    const TAKER_REBATE: Decimal = Decimal::ZERO;
+}
+
+/// One account's fees at a venue `S`: the taker and maker coefficients on the
+/// `(p × (1 − p))^exponent` curve and the share of the taker fee paid back later. Rounding is the
+/// venue's ([`FeeSchedule::ROUNDING`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
-    serde(bound(deserialize = "T: serde::Deserialize<'de> + FeeScalar"))
+    serde(bound(
+        serialize = "T: serde::Serialize",
+        deserialize = "T: serde::Deserialize<'de> + FeeScalar"
+    ))
 )]
-pub struct Fees<T = Decimal> {
-    /// Θ for a taker fill (`fd.r`, or the US `feeCoefficient` or tier coefficient).
+pub struct Fees<T = Decimal, S: FeeSchedule = Pmus> {
+    /// Θ for a taker fill (`fd.r`, or the US tier or program coefficient).
     #[cfg_attr(feature = "serde", serde(rename = "fee_rate"))]
     taker: T,
     /// The curve's exponent (`fd.e`; 1 on Polymarket US).
@@ -213,8 +314,8 @@ pub struct Fees<T = Decimal> {
     /// The share of a taker fee paid back later (`0.70` for the US API program).
     #[cfg_attr(feature = "serde", serde(default = "zero"))]
     taker_rebate: T,
-    #[cfg_attr(feature = "serde", serde(default))]
-    rounding: FeeRounding,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    schedule: PhantomData<S>,
 }
 
 #[cfg(feature = "serde")]
@@ -222,14 +323,16 @@ fn zero<T: FeeScalar>() -> T {
     T::ZERO
 }
 
-/// The exact schedule, as market metadata states it.
-pub type FeeCalculator = Fees<Decimal>;
+/// Polymarket US fees.
+pub type PmusFees<T = Decimal> = Fees<T, Pmus>;
+
+/// The international CLOB's exact schedule, as market metadata states it.
+pub type FeeCalculator = Fees<Decimal, Clob>;
 
 // The negated comparisons are deliberate: a NaN `f64` fails every check, so it is refused.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
-impl<T: FeeScalar> Fees<T> {
-    /// A taker-only schedule from market metadata, rounded as the international CLOB rounds:
-    /// no maker fee and no taker rebate until set.
+impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
+    /// A taker-only schedule: no maker fee and no taker rebate until set.
     ///
     /// # Errors
     ///
@@ -243,18 +346,18 @@ impl<T: FeeScalar> Fees<T> {
             exponent,
             maker: T::ZERO,
             taker_rebate: T::ZERO,
-            rounding: FeeRounding::FiveDecimals,
+            schedule: PhantomData,
         })
     }
 
-    /// A Polymarket US schedule: `Θ × C × p × (1 − p)`, whole cents, half to even. `taker` is the
-    /// account's Θ (tier or program); set the maker rebate and taker rebate from configuration.
+    /// A taker-only schedule at the venue's standard exponent: `taker` is the account's Θ (tier,
+    /// program or market metadata).
     ///
     /// # Errors
     ///
     /// As [`Fees::new`].
-    pub fn us(taker: T) -> Result<Self, PowerFeeError> {
-        Ok(Self::new(taker, 1)?.with_rounding(FeeRounding::Cents))
+    pub fn with_rate(taker: T) -> Result<Self, PowerFeeError> {
+        Self::new(taker, S::EXPONENT)
     }
 
     /// The maker coefficient: zero, or negative for a maker rebate credited at the fill.
@@ -287,12 +390,6 @@ impl<T: FeeScalar> Fees<T> {
         Ok(self)
     }
 
-    /// The venue's rounding.
-    pub const fn with_rounding(mut self, rounding: FeeRounding) -> Self {
-        self.rounding = rounding;
-        self
-    }
-
     /// The taker coefficient Θ.
     pub const fn rate(&self) -> T {
         self.taker
@@ -315,7 +412,7 @@ impl<T: FeeScalar> Fees<T> {
 
     /// The venue's rounding.
     pub const fn rounding(&self) -> FeeRounding {
-        self.rounding
+        S::ROUNDING
     }
 
     /// Whether a taker fill pays nothing at any price.
@@ -369,9 +466,7 @@ impl<T: FeeScalar> Fees<T> {
     ///
     /// Non-positive `shares`, a `price` outside `[0, 1]`, or arithmetic that overflows.
     pub fn fee(&self, liquidity: Liquidity, shares: T, price: T) -> Result<T, PowerFeeError> {
-        Ok(self
-            .exact(liquidity, shares, price)?
-            .round_fee(self.rounding))
+        Ok(self.exact(liquidity, shares, price)?.round_fee(S::ROUNDING))
     }
 
     /// What one order's taker fills charge, fill by fill: each fill's rounded fee, cut from the
@@ -391,7 +486,7 @@ impl<T: FeeScalar> Fees<T> {
         let mut charged_total = T::ZERO;
         for &(shares, price) in fills {
             let exact = self.exact(liquidity, shares, price)?;
-            let fee = exact.round_fee(self.rounding);
+            let fee = exact.round_fee(S::ROUNDING);
             exact_total = exact_total
                 .checked_add(exact)
                 .ok_or(PowerFeeError::ArithmeticOverflow)?;
@@ -404,7 +499,7 @@ impl<T: FeeScalar> Fees<T> {
             return Ok(charged);
         }
         let mut excess = charged_total
-            .checked_sub(exact_total.round_fee(self.rounding))
+            .checked_sub(exact_total.round_fee(S::ROUNDING))
             .ok_or(PowerFeeError::ArithmeticOverflow)?;
         for fee in charged.iter_mut().rev() {
             if !(excess > T::ZERO) {
@@ -497,7 +592,7 @@ impl<T: FeeScalar> Fees<T> {
         let per_share = self.per_share(liquidity, price)?;
         let (spendable, per_share) = if per_share > T::ZERO {
             let spendable = bid
-                .checked_sub(T::tick(self.rounding))
+                .checked_sub(T::tick(S::ROUNDING))
                 .ok_or(PowerFeeError::ArithmeticOverflow)?;
             (spendable, per_share)
         } else {
@@ -514,7 +609,18 @@ impl<T: FeeScalar> Fees<T> {
     }
 }
 
-impl Fees<Decimal> {
+impl<S: FeeSchedule> Fees<Decimal, S> {
+    /// The venue's standard schedule, from its [`FeeSchedule`] constants.
+    pub const fn standard() -> Self {
+        Self {
+            taker: S::TAKER,
+            exponent: S::EXPONENT,
+            maker: S::MAKER,
+            taker_rebate: S::TAKER_REBATE,
+            schedule: PhantomData,
+        }
+    }
+
     /// Alias of [`Fees::new`] under the metadata names.
     ///
     /// # Errors
@@ -524,24 +630,12 @@ impl Fees<Decimal> {
         Self::new(rate, exponent)
     }
 
-    /// The international CLOB's current Crypto schedule: rate `0.07`, exponent `1`. Metadata
-    /// stays authoritative for live markets.
-    pub const fn crypto() -> Self {
-        Self {
-            taker: CURRENT_CRYPTO_RATE,
-            exponent: CURRENT_CRYPTO_EXPONENT,
-            maker: Decimal::ZERO,
-            taker_rebate: Decimal::ZERO,
-            rounding: FeeRounding::FiveDecimals,
-        }
-    }
-
     /// The same schedule over `f64`, for model arithmetic.
     ///
     /// # Errors
     ///
     /// [`PowerFeeError::FloatConversion`] when a coefficient has no finite `f64`.
-    pub fn to_f64(&self) -> Result<Fees<f64>, PowerFeeError> {
+    pub fn to_f64(&self) -> Result<Fees<f64, S>, PowerFeeError> {
         let float =
             |value: Decimal| f64::try_from(value).map_err(|_| PowerFeeError::FloatConversion);
         Ok(Fees {
@@ -549,7 +643,7 @@ impl Fees<Decimal> {
             exponent: self.exponent,
             maker: float(self.maker)?,
             taker_rebate: float(self.taker_rebate)?,
-            rounding: self.rounding,
+            schedule: PhantomData,
         })
     }
 
@@ -586,6 +680,14 @@ impl Fees<Decimal> {
     }
 }
 
+impl Fees<Decimal, Clob> {
+    /// The international CLOB's current Crypto schedule: rate `0.07`, exponent `1`. Metadata
+    /// stays authoritative for live markets.
+    pub const fn crypto() -> Self {
+        Self::standard()
+    }
+}
+
 /// The fee schedule an account trades under over time: a promotional program until it ends, then
 /// the account's volume tier. Polymarket US fixes an order's coefficients when the order is
 /// inserted, so look the schedule up at the insert time.
@@ -597,15 +699,16 @@ impl Fees<Decimal> {
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
     serde(bound(
+        serialize = "T: serde::Serialize, At: serde::Serialize",
         deserialize = "T: serde::Deserialize<'de> + FeeScalar, At: serde::Deserialize<'de>"
     ))
 )]
-pub struct FeePlan<T, At> {
+pub struct FeePlan<T, At, S: FeeSchedule = Pmus> {
     /// The account's schedule outside any program.
-    pub tier: Fees<T>,
+    pub tier: Fees<T, S>,
     /// A program and the instant it ends: the US API program (Θ 0.0695, 70% taker rebate) runs
     /// through 2026-12-31.
-    pub program: Option<FeeProgram<T, At>>,
+    pub program: Option<FeeProgram<T, At, S>>,
 }
 
 /// A dated fee program.
@@ -614,18 +717,19 @@ pub struct FeePlan<T, At> {
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
     serde(bound(
+        serialize = "T: serde::Serialize, At: serde::Serialize",
         deserialize = "T: serde::Deserialize<'de> + FeeScalar, At: serde::Deserialize<'de>"
     ))
 )]
-pub struct FeeProgram<T, At> {
-    pub fees: Fees<T>,
+pub struct FeeProgram<T, At, S: FeeSchedule = Pmus> {
+    pub fees: Fees<T, S>,
     /// The first instant the program no longer covers.
     pub ends: At,
 }
 
-impl<T: FeeScalar, At: PartialOrd> FeePlan<T, At> {
+impl<T: FeeScalar, At: PartialOrd, S: FeeSchedule> FeePlan<T, At, S> {
     /// The schedule an order inserted at `at` pays.
-    pub fn at(&self, at: &At) -> &Fees<T> {
+    pub fn at(&self, at: &At) -> &Fees<T, S> {
         match &self.program {
             Some(program) if *at < program.ends => &program.fees,
             _ => &self.tier,
@@ -691,13 +795,30 @@ mod tests {
         );
     }
 
-    fn us_api() -> Fees<Decimal> {
-        Fees::us(Decimal::new(695, 4))
-            .unwrap()
-            .with_maker(Decimal::new(-104, 4))
+    fn us_api() -> PmusFees {
+        Pmus::API.with_maker(Pmus::MAKER_TIERS[3]).unwrap()
+    }
+
+    #[test]
+    fn published_constants_match_their_builders() {
+        let built = PmusFees::with_rate(Decimal::new(695, 4))
             .unwrap()
             .with_taker_rebate(Decimal::new(70, 2))
-            .unwrap()
+            .unwrap();
+        assert_eq!(Pmus::API, built);
+        assert_eq!(Pmus::API.rounding(), FeeRounding::Cents);
+        assert_eq!(PmusFees::standard().rate(), Decimal::new(11, 2));
+        assert_eq!(Pmus::TAKER_TIERS[3], Pmus::API.rate());
+        assert_eq!(Pmus::MAKER_TIERS[2], Decimal::new(-70, 4));
+        assert_eq!(Pmus::TAKER_REBATE_TIERS[5], Decimal::new(30, 2));
+        assert_eq!(
+            FeeCalculator::crypto(),
+            FeeCalculator::new(Decimal::new(7, 2), 1).unwrap()
+        );
+        assert_eq!(
+            FeeCalculator::crypto().rounding(),
+            FeeRounding::FiveDecimals
+        );
     }
 
     /// The worked examples on <https://docs.polymarket.us/fees>: Θ 0.0695 on 100 contracts.
@@ -783,7 +904,7 @@ mod tests {
 
     #[test]
     fn a_rebate_above_the_taker_fee_or_outside_one_is_refused() {
-        let fees = Fees::us(Decimal::new(695, 4)).unwrap();
+        let fees = PmusFees::with_rate(Decimal::new(695, 4)).unwrap();
         assert_eq!(
             fees.with_maker(Decimal::new(-1, 1)),
             Err(PowerFeeError::NegativeRate)
@@ -801,7 +922,7 @@ mod tests {
     /// The API program covers orders inserted before its end, then the volume tier applies.
     #[test]
     fn a_program_gives_way_to_the_tier_when_it_ends() {
-        let tier = Fees::us(Decimal::new(11, 2)).unwrap();
+        let tier = PmusFees::standard();
         let plan = FeePlan {
             tier,
             program: Some(FeeProgram {
@@ -974,7 +1095,10 @@ mod tests {
                 .unwrap(),
             Decimal::new(5198, 5)
         );
-        assert_eq!(Fees::new(f64::NAN, 1), Err(PowerFeeError::NegativeRate));
+        assert_eq!(
+            Fees::<f64, Clob>::new(f64::NAN, 1),
+            Err(PowerFeeError::NegativeRate)
+        );
     }
 
     #[cfg(feature = "json")]

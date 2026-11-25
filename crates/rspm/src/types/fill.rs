@@ -3,14 +3,10 @@
     Created At: 2026.03.17:19:46:41
     Contrib: @FL03
 */
+use crate::fees::{FeeSchedule, Fees, Liquidity, PowerFeeError};
 use crate::{ClobSide, Side};
 use alloc::string::String;
 use core::fmt;
-
-/// The Polymarket CLOB taker fee rate applied to aggressive (market) fills.
-///
-/// Polymarket currently charges 2 bps (0.02%) on each matched trade.
-const TAKER_FEE_RATE: f64 = 0.0002;
 
 /// An order-execution result for one action on one prediction-market outcome token.
 ///
@@ -122,12 +118,18 @@ impl Fill {
         self.outcome == Side::No
     }
 
-    /// Approximate taker fee for this fill.
+    /// This fill's taker fee under `fees` (for example [`crate::fees::PmusFees`]), rounded as the
+    /// venue rounds it. An empty fill pays nothing. This is a transaction fee, not a
+    /// position-level PnL calculation.
     ///
-    /// Uses `TAKER_FEE_RATE` applied to the fill notional. This is a transaction
-    /// fee, not a position-level PnL calculation.
-    pub fn fee(&self) -> f64 {
-        self.notional * TAKER_FEE_RATE
+    /// # Errors
+    ///
+    /// A price outside `[0, 1]`, or arithmetic that overflows.
+    pub fn fee<S: FeeSchedule>(&self, fees: &Fees<f64, S>) -> Result<f64, PowerFeeError> {
+        if self.size <= 0.0 {
+            return Ok(0.0);
+        }
+        fees.fee(Liquidity::Taker, self.size, self.price)
     }
 }
 
@@ -255,12 +257,14 @@ mod tests {
     }
 
     #[test]
-    fn fee_uses_notional_for_either_action() {
+    fn fee_is_the_venue_taker_fee_for_either_action() {
+        let fees = crate::fees::Pmus::API.to_f64().unwrap();
         let buy = fill_with_axes(Side::No, ClobSide::Buy);
         let sell = fill_with_axes(Side::No, ClobSide::Sell);
 
-        assert!(buy.fee() >= 0.0);
-        assert_eq!(buy.fee(), sell.fee());
+        // 0.0695 × 10 × 0.5 × 0.5 = 0.17375 → 0.17.
+        assert_eq!(buy.fee(&fees), Ok(0.17));
+        assert_eq!(buy.fee(&fees), sell.fee(&fees));
     }
 
     #[test]

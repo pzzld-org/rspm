@@ -1,7 +1,4 @@
 {
-  "rust-analyzer.check.features": [
-    "default",
-    "full"
-  ],
+  "rust-analyzer.check.features": "all",
   "nixEnvSelector.suggestion": false
 }

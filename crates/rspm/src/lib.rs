@@ -35,8 +35,11 @@ pub mod error;
 pub mod fees;
 #[cfg(feature = "gamma")]
 pub mod gamma;
+pub mod rebates;
 #[cfg(feature = "clob")]
 pub mod retry;
+#[cfg(feature = "us")]
+pub mod us;
 #[cfg(feature = "watch")]
 pub mod watch;
 

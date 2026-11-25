@@ -188,13 +188,13 @@ impl<T: FeeScalar, S: FeeSchedule> MakerRebate<T, S> {
 }
 
 impl Pmus {
-    /// The API program's cash back: 70% of every API taker fee, paid weekly, 12:01 AM ET
-    /// 2026-11-21 (05:01Z) through 2026-12-31 ET (ends 2027-01-01T05:00Z), straight trades only.
+    /// The API program's cash back: 70% of every API taker fee, paid weekly, over the program's
+    /// window ([`Pmus::API_STARTS`] to [`Pmus::API_ENDS`]), straight trades only.
     pub const API_CASHBACK: TakerCashback = TakerCashback {
         share: Decimal::from_parts(70, 0, 0, false, 2),
         payout: Payout::Weekly,
-        starts: 1_795_237_260,
-        ends: 1_798_779_600,
+        starts: Pmus::API_STARTS,
+        ends: Pmus::API_ENDS,
     };
 
     /// Share of taker fees paid back weekly by taker rebate tier 1 to 6 (qualifying taker

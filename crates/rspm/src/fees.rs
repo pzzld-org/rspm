@@ -230,9 +230,17 @@ impl FeeSchedule for Pmus {
 }
 
 impl Pmus {
-    /// The API program's fee: every API taker fill pays Θ 0.0695, 12:01 AM ET 2026-11-21 through
-    /// 2026-12-31 ET, straight trades only. The end date belongs in configuration
-    /// ([`FeePlan`]); the program's cash back is [`Pmus::API_CASHBACK`].
+    /// The API program's first second, Unix: 12:01 AM ET 2026-11-21 (05:01Z). One definition;
+    /// the fee and the cash back both read it, so changing the window is this one line.
+    pub const API_STARTS: i64 = 1_795_237_260;
+
+    /// The first second the API program no longer covers, Unix: 2027-01-01T05:00Z, the end of
+    /// 2026-12-31 ET.
+    pub const API_ENDS: i64 = 1_798_779_600;
+
+    /// The API program's fee: every API taker fill pays Θ 0.0695 from [`Pmus::API_STARTS`] until
+    /// [`Pmus::API_ENDS`], straight trades only. The program's cash back is
+    /// [`Pmus::API_CASHBACK`].
     pub const API: PmusFees = Fees {
         taker: Decimal::from_parts(695, 0, 0, false, 4),
         exponent: 1,

@@ -12,10 +12,10 @@
 //! ```
 //!
 //! where `Θ` is the taker coefficient: tiered by trailing 30-day volume for app and web orders,
-//! a flat 0.0695 for API orders. A maker pays the maker coefficient on the same curve, which is
-//! zero or negative (a rebate credited at the fill) by maker tier. Taker rebates (the API
-//! program's 70%, or the volume tiers) are a share of the taker fee paid back later, so they
-//! never reduce what a fill charges. Across one order's fills the total charged never exceeds
+//! a flat 0.0695 for API orders. A maker pays no fee. Money paid back (the taker cash back of the
+//! API program or the volume tiers, the maker rebate) is not a fee: it lives in
+//! [`crate::rebates`], so [`Fees`] is the pure published fee and a program can be removed
+//! without touching it. Across one order's fills the total charged never exceeds
 //! the rounding of the order's exact fee ([`Fees::order_fees`]). The international CLOB uses the
 //! same curve with a market-supplied exponent and five-decimal rounding.
 //!
@@ -212,10 +212,8 @@ pub trait FeeSchedule:
     const EXPONENT: u32;
     /// The standard taker Θ: what an account with no tier or program pays.
     const TAKER: Decimal;
-    /// The standard maker Θ: zero, or negative for a rebate.
+    /// The standard maker Θ: zero or positive (a rebate is not a fee, see [`crate::rebates`]).
     const MAKER: Decimal;
-    /// The standard share of a taker fee paid back later.
-    const TAKER_REBATE: Decimal;
 }
 
 /// Polymarket US (<https://docs.polymarket.us/fees>): `Θ × C × p × (1 − p)`, whole cents, half to
@@ -229,18 +227,16 @@ impl FeeSchedule for Pmus {
     const EXPONENT: u32 = 1;
     const TAKER: Decimal = Self::TAKER_TIERS[0];
     const MAKER: Decimal = Decimal::ZERO;
-    const TAKER_REBATE: Decimal = Decimal::ZERO;
 }
 
 impl Pmus {
-    /// The API program: every API taker fill pays Θ 0.0695 and gets 70% of that fee back weekly,
-    /// 12:01 AM ET 2026-11-21 through 2026-12-31 ET, straight trades only. Add the account's maker
-    /// rebate with [`Fees::with_maker`]; the end date belongs in configuration ([`FeePlan`]).
+    /// The API program's fee: every API taker fill pays Θ 0.0695, 12:01 AM ET 2026-11-21 through
+    /// 2026-12-31 ET, straight trades only. The end date belongs in configuration
+    /// ([`FeePlan`]); the program's cash back is [`Pmus::API_CASHBACK`].
     pub const API: PmusFees = Fees {
         taker: Decimal::from_parts(695, 0, 0, false, 4),
         exponent: 1,
         maker: Decimal::ZERO,
-        taker_rebate: Decimal::from_parts(70, 0, 0, false, 2),
         schedule: PhantomData,
     };
 
@@ -251,27 +247,6 @@ impl Pmus {
         Decimal::from_parts(10, 0, 0, false, 2),
         Decimal::from_parts(9, 0, 0, false, 2),
         Decimal::from_parts(695, 0, 0, false, 4),
-    ];
-
-    /// Maker Θ by maker rebate tier 1 to 4 (qualifying maker volume below $10M, to $50M, to
-    /// $200M, above), credited at the fill.
-    pub const MAKER_TIERS: [Decimal; 4] = [
-        Decimal::ZERO,
-        Decimal::from_parts(35, 0, 0, true, 4),
-        Decimal::from_parts(70, 0, 0, true, 4),
-        Decimal::from_parts(104, 0, 0, true, 4),
-    ];
-
-    /// Share of taker fees paid back weekly by taker rebate tier 1 to 6 (qualifying taker
-    /// volume below $250k, to $1M, to $10M, to $25M, to $50M, above). Set independently of the
-    /// taker fee tier.
-    pub const TAKER_REBATE_TIERS: [Decimal; 6] = [
-        Decimal::ZERO,
-        Decimal::from_parts(3, 0, 0, false, 2),
-        Decimal::from_parts(5, 0, 0, false, 2),
-        Decimal::from_parts(10, 0, 0, false, 2),
-        Decimal::from_parts(15, 0, 0, false, 2),
-        Decimal::from_parts(30, 0, 0, false, 2),
     ];
 }
 
@@ -286,12 +261,10 @@ impl FeeSchedule for Clob {
     const EXPONENT: u32 = CURRENT_CRYPTO_EXPONENT;
     const TAKER: Decimal = CURRENT_CRYPTO_RATE;
     const MAKER: Decimal = Decimal::ZERO;
-    const TAKER_REBATE: Decimal = Decimal::ZERO;
 }
 
 /// One account's fees at a venue `S`: the taker and maker coefficients on the
-/// `(p × (1 − p))^exponent` curve and the share of the taker fee paid back later. Rounding is the
-/// venue's ([`FeeSchedule::ROUNDING`]).
+/// `(p × (1 − p))^exponent` curve. Rounding is the venue's ([`FeeSchedule::ROUNDING`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
@@ -308,12 +281,9 @@ pub struct Fees<T = Decimal, S: FeeSchedule = Pmus> {
     /// The curve's exponent (`fd.e`; 1 on Polymarket US).
     #[cfg_attr(feature = "serde", serde(rename = "fee_exponent"))]
     exponent: u32,
-    /// Θ for a maker fill: zero, or negative for a maker rebate.
+    /// Θ for a maker fill: zero on both Polymarket venues.
     #[cfg_attr(feature = "serde", serde(default = "zero"))]
     maker: T,
-    /// The share of a taker fee paid back later (`0.70` for the US API program).
-    #[cfg_attr(feature = "serde", serde(default = "zero"))]
-    taker_rebate: T,
     #[cfg_attr(feature = "serde", serde(skip))]
     schedule: PhantomData<S>,
 }
@@ -332,7 +302,7 @@ pub type FeeCalculator = Fees<Decimal, Clob>;
 // The negated comparisons are deliberate: a NaN `f64` fails every check, so it is refused.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
-    /// A taker-only schedule: no maker fee and no taker rebate until set.
+    /// A taker-only schedule: no maker fee until set.
     ///
     /// # Errors
     ///
@@ -345,7 +315,6 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
             taker,
             exponent,
             maker: T::ZERO,
-            taker_rebate: T::ZERO,
             schedule: PhantomData,
         })
     }
@@ -360,33 +329,16 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
         Self::new(taker, S::EXPONENT)
     }
 
-    /// The maker coefficient: zero, or negative for a maker rebate credited at the fill.
+    /// The maker coefficient: a fee, so zero or positive.
     ///
     /// # Errors
     ///
-    /// [`PowerFeeError::NegativeRate`] when `maker` is not a number or a rebate larger than the
-    /// taker fee.
+    /// [`PowerFeeError::NegativeRate`] when `maker` is negative or not a number.
     pub fn with_maker(mut self, maker: T) -> Result<Self, PowerFeeError> {
-        let floor = T::ZERO
-            .checked_sub(self.taker)
-            .ok_or(PowerFeeError::ArithmeticOverflow)?;
-        if !(maker >= floor) {
+        if !(maker >= T::ZERO) {
             return Err(PowerFeeError::NegativeRate);
         }
         self.maker = maker;
-        Ok(self)
-    }
-
-    /// The share of each taker fee paid back later, in `[0, 1]`.
-    ///
-    /// # Errors
-    ///
-    /// [`PowerFeeError::NegativeRate`] outside `[0, 1]`.
-    pub fn with_taker_rebate(mut self, rebate: T) -> Result<Self, PowerFeeError> {
-        if !(T::ZERO <= rebate && rebate <= T::ONE) {
-            return Err(PowerFeeError::NegativeRate);
-        }
-        self.taker_rebate = rebate;
         Ok(self)
     }
 
@@ -398,11 +350,6 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
     /// The maker coefficient.
     pub const fn maker(&self) -> T {
         self.maker
-    }
-
-    /// The share of a taker fee paid back later.
-    pub const fn taker_rebate(&self) -> T {
-        self.taker_rebate
     }
 
     /// The curve's exponent.
@@ -428,7 +375,7 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
     }
 
     /// The fee on one contract at `price`, unrounded: `Θ × (p × (1 − p))^exponent`, with the
-    /// taker or maker Θ. Negative for a maker rebate.
+    /// taker or maker Θ.
     ///
     /// # Errors
     ///
@@ -459,8 +406,7 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
             .ok_or(PowerFeeError::ArithmeticOverflow)
     }
 
-    /// What one fill of `shares` at `price` charges, rounded as the venue rounds it. Negative
-    /// for a maker rebate.
+    /// What one fill of `shares` at `price` charges, rounded as the venue rounds it.
     ///
     /// # Errors
     ///
@@ -516,28 +462,6 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
         Ok(charged)
     }
 
-    /// A fill's fee less the taker rebate paid back later: the fee's economic cost once the
-    /// rebate arrives. Unrounded, since the venue does not state how a rebate rounds.
-    ///
-    /// # Errors
-    ///
-    /// As [`Fees::fee`].
-    pub fn fee_after_rebate(
-        &self,
-        liquidity: Liquidity,
-        shares: T,
-        price: T,
-    ) -> Result<T, PowerFeeError> {
-        let fee = self.fee(liquidity, shares, price)?;
-        if liquidity == Liquidity::Maker {
-            return Ok(fee);
-        }
-        T::ONE
-            .checked_sub(self.taker_rebate)
-            .and_then(|kept| fee.checked_mul(kept))
-            .ok_or(PowerFeeError::ArithmeticOverflow)
-    }
-
     /// What a buy of `shares` at `price` takes at the fill: notional plus fee.
     ///
     /// # Errors
@@ -575,7 +499,7 @@ impl<T: FeeScalar, S: FeeSchedule> Fees<T, S> {
     /// tick. A fill at a lower price costs less per share (`d/dp [p + Θ·p(1−p)] = 1 + Θ(1 − 2p) >
     /// 0` for `Θ < 1`), and a venue grid only floors shares, so neither pushes the spend past the
     /// bid. A leg that pays nothing (a free schedule, or a maker without a fee) buys exactly
-    /// `bid / price`; a maker rebate is not spent ahead of its credit.
+    /// `bid / price`. Money paid back later is not spent ahead of its credit.
     ///
     /// # Errors
     ///
@@ -616,7 +540,6 @@ impl<S: FeeSchedule> Fees<Decimal, S> {
             taker: S::TAKER,
             exponent: S::EXPONENT,
             maker: S::MAKER,
-            taker_rebate: S::TAKER_REBATE,
             schedule: PhantomData,
         }
     }
@@ -642,7 +565,6 @@ impl<S: FeeSchedule> Fees<Decimal, S> {
             taker: float(self.taker)?,
             exponent: self.exponent,
             maker: float(self.maker)?,
-            taker_rebate: float(self.taker_rebate)?,
             schedule: PhantomData,
         })
     }
@@ -706,8 +628,7 @@ impl Fees<Decimal, Clob> {
 pub struct FeePlan<T, At, S: FeeSchedule = Pmus> {
     /// The account's schedule outside any program.
     pub tier: Fees<T, S>,
-    /// A program and the instant it ends: the US API program (Θ 0.0695, 70% taker rebate) runs
-    /// through 2026-12-31.
+    /// A program and the instant it ends: the US API program's Θ 0.0695 runs through 2026-12-31.
     pub program: Option<FeeProgram<T, At, S>>,
 }
 
@@ -737,7 +658,7 @@ impl<T: FeeScalar, At: PartialOrd, S: FeeSchedule> FeePlan<T, At, S> {
     }
 }
 
-fn pow<T: FeeScalar>(mut base: T, mut exponent: u32) -> Option<T> {
+pub(crate) fn pow<T: FeeScalar>(mut base: T, mut exponent: u32) -> Option<T> {
     let mut product = T::ONE;
     while exponent > 0 {
         if exponent & 1 == 1 {
@@ -796,21 +717,16 @@ mod tests {
     }
 
     fn us_api() -> PmusFees {
-        Pmus::API.with_maker(Pmus::MAKER_TIERS[3]).unwrap()
+        Pmus::API
     }
 
     #[test]
     fn published_constants_match_their_builders() {
-        let built = PmusFees::with_rate(Decimal::new(695, 4))
-            .unwrap()
-            .with_taker_rebate(Decimal::new(70, 2))
-            .unwrap();
+        let built = PmusFees::with_rate(Decimal::new(695, 4)).unwrap();
         assert_eq!(Pmus::API, built);
         assert_eq!(Pmus::API.rounding(), FeeRounding::Cents);
         assert_eq!(PmusFees::standard().rate(), Decimal::new(11, 2));
         assert_eq!(Pmus::TAKER_TIERS[3], Pmus::API.rate());
-        assert_eq!(Pmus::MAKER_TIERS[2], Decimal::new(-70, 4));
-        assert_eq!(Pmus::TAKER_REBATE_TIERS[5], Decimal::new(30, 2));
         assert_eq!(
             FeeCalculator::crypto(),
             FeeCalculator::new(Decimal::new(7, 2), 1).unwrap()
@@ -836,19 +752,10 @@ mod tests {
         assert_eq!(fee(30), Ok(Decimal::new(146, 2))); // 1.4595
         assert_eq!(fee(65), Ok(Decimal::new(158, 2))); // 1.581125
         assert_eq!(fee(50), Ok(Decimal::new(174, 2))); // 1.7375
-        // Tier 4 maker rebate at 0.10: −0.0104 × 100 × 0.09 = −0.0936 → −0.09, credited at the fill.
+        // A maker pays no fee; its rebate is crate::rebates::MakerRebate.
         assert_eq!(
             fees.fee(Liquidity::Maker, Decimal::ONE_HUNDRED, Decimal::new(10, 2)),
-            Ok(Decimal::new(-9, 2))
-        );
-        // The 70% API rebate is paid back on the taker fee; makers keep their rebate whole.
-        assert_eq!(
-            fees.fee_after_rebate(Liquidity::Taker, Decimal::ONE_HUNDRED, Decimal::new(50, 2)),
-            Ok(Decimal::new(5220, 4))
-        );
-        assert_eq!(
-            fees.fee_after_rebate(Liquidity::Maker, Decimal::ONE_HUNDRED, Decimal::new(10, 2)),
-            Ok(Decimal::new(-9, 2))
+            Ok(Decimal::ZERO)
         );
     }
 
@@ -903,18 +810,10 @@ mod tests {
     }
 
     #[test]
-    fn a_rebate_above_the_taker_fee_or_outside_one_is_refused() {
+    fn a_negative_maker_fee_is_refused() {
         let fees = PmusFees::with_rate(Decimal::new(695, 4)).unwrap();
         assert_eq!(
             fees.with_maker(Decimal::new(-1, 1)),
-            Err(PowerFeeError::NegativeRate)
-        );
-        assert_eq!(
-            fees.with_taker_rebate(Decimal::new(11, 1)),
-            Err(PowerFeeError::NegativeRate)
-        );
-        assert_eq!(
-            fees.with_taker_rebate(Decimal::NEGATIVE_ONE),
             Err(PowerFeeError::NegativeRate)
         );
     }
@@ -931,7 +830,6 @@ mod tests {
             }), // 2027-01-01Z
         };
         assert_eq!(plan.at(&1_798_761_599).rate(), Decimal::new(695, 4));
-        assert_eq!(plan.at(&1_798_761_599).taker_rebate(), Decimal::new(70, 2));
         assert_eq!(plan.at(&1_798_761_600), &tier);
         assert_eq!(
             FeePlan::<Decimal, i64> {
